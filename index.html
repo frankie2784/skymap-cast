@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SkyMap Receiver</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+    #sky { display: block; width: 100vw; height: 100vh; }
+
+    /* ── Calibration SVG overlay ── */
+    #calibration-svg {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: none;           /* shown when CALIBRATING */
+      pointer-events: none;
+      overflow: visible;
+    }
+
+    /* ── Status overlay ── */
+    #overlay {
+      position: fixed;
+      bottom: 2rem;
+      left: 50%;
+      transform: translateX(-50%);
+      text-align: center;
+      pointer-events: none;
+      user-select: none;
+    }
+    #status {
+      font-family: 'Courier New', monospace;
+      font-size: 1rem;
+      color: rgba(100, 160, 255, 0.8);
+      letter-spacing: 0.08em;
+      transition: opacity 1.5s ease;
+    }
+    #detail {
+      font-family: 'Courier New', monospace;
+      font-size: 0.75rem;
+      color: rgba(100, 160, 255, 0.5);
+      letter-spacing: 0.06em;
+      margin-top: 0.25rem;
+      transition: opacity 1.5s ease;
+    }
+  </style>
+</head>
+<body>
+
+  <canvas id="sky"></canvas>
+
+  <!--
+    Calibration overlay — drawn as a full-screen SVG in viewBox="0 0 1 1" (normalised coords).
+    receiver.js updates the polygon points and corner markers in real-time as the phone sends
+    QUAD_CORNERS messages. The top-centre ▲ marker is the orientation reference.
+  -->
+  <svg id="calibration-svg" viewBox="0 0 1 1" preserveAspectRatio="none">
+    <defs>
+      <!-- Pulsing animation for corner dots -->
+      <radialGradient id="cornerGlow" cx="50%" cy="50%" r="50%">
+        <stop offset="0%"   stop-color="#4a9eff" stop-opacity="1"/>
+        <stop offset="100%" stop-color="#4a9eff" stop-opacity="0"/>
+      </radialGradient>
+    </defs>
+
+    <!-- Faint blue fill inside the quad -->
+    <polygon id="cal-poly"
+      points="0.15,0.20 0.85,0.20 0.85,0.80 0.15,0.80"
+      fill="rgba(30,80,200,0.08)"
+      stroke="rgba(74,158,255,0.6)"
+      stroke-width="0.003"
+      vector-effect="non-scaling-stroke"/>
+
+    <!-- Top edge — highlighted to show orientation reference -->
+    <line id="cal-top-edge"
+      x1="0.15" y1="0.20" x2="0.85" y2="0.20"
+      stroke="rgba(74,158,255,0.9)"
+      stroke-width="0.004"
+      vector-effect="non-scaling-stroke"/>
+
+    <!-- Corner draggable markers (phone controls these) -->
+    <circle id="dot-tl" cx="0.15" cy="0.20" r="0.018"
+      fill="rgba(74,158,255,0.25)" stroke="#4a9eff" stroke-width="0.003"
+      vector-effect="non-scaling-stroke">
+      <animate attributeName="r" values="0.016;0.022;0.016" dur="2s" repeatCount="indefinite"/>
+    </circle>
+    <circle id="dot-tr" cx="0.85" cy="0.20" r="0.018"
+      fill="rgba(74,158,255,0.25)" stroke="#4a9eff" stroke-width="0.003"
+      vector-effect="non-scaling-stroke">
+      <animate attributeName="r" values="0.016;0.022;0.016" dur="2s" begin="0.5s" repeatCount="indefinite"/>
+    </circle>
+    <circle id="dot-br" cx="0.85" cy="0.80" r="0.018"
+      fill="rgba(74,158,255,0.25)" stroke="#4a9eff" stroke-width="0.003"
+      vector-effect="non-scaling-stroke">
+      <animate attributeName="r" values="0.016;0.022;0.016" dur="2s" begin="1s" repeatCount="indefinite"/>
+    </circle>
+    <circle id="dot-bl" cx="0.15" cy="0.80" r="0.018"
+      fill="rgba(74,158,255,0.25)" stroke="#4a9eff" stroke-width="0.003"
+      vector-effect="non-scaling-stroke">
+      <animate attributeName="r" values="0.016;0.022;0.016" dur="2s" begin="1.5s" repeatCount="indefinite"/>
+    </circle>
+
+    <!--
+      Top-centre orientation marker (▲).
+      Shown on both the phone and the projector.
+      The user physically points their phone at this marker — the phone's compass
+      reading at that moment becomes the azimuthOffset sent in the SETUP message.
+    -->
+    <g id="cal-marker" transform="translate(0.5, 0.17)">
+      <!-- Outer glow ring -->
+      <circle cx="0" cy="0" r="0.022" fill="rgba(74,158,255,0.15)"
+        stroke="rgba(74,158,255,0.5)" stroke-width="0.002"
+        vector-effect="non-scaling-stroke">
+        <animate attributeName="r" values="0.020;0.028;0.020" dur="1.5s" repeatCount="indefinite"/>
+        <animate attributeName="opacity" values="1;0.4;1" dur="1.5s" repeatCount="indefinite"/>
+      </circle>
+      <!-- Triangle -->
+      <polygon points="0,-0.014 0.010,0.007 -0.010,0.007"
+        fill="#4a9eff" opacity="0.95"/>
+    </g>
+
+    <!-- Instruction text — shown while calibrating -->
+    <text id="cal-instruction"
+      x="0.5" y="0.93"
+      text-anchor="middle"
+      font-family="'Courier New', monospace"
+      font-size="0.032"
+      fill="rgba(100,160,255,0.7)"
+      vector-effect="non-scaling-stroke">
+      Drag corners on your phone to fit the projection surface
+    </text>
+  </svg>
+
+  <div id="overlay">
+    <div id="status">Initialising…</div>
+    <div id="detail"></div>
+  </div>
+
+  <!--
+    Cast Web Receiver SDK — must be first. Only loads on Chromecast hardware;
+    receiver.js detects its absence and runs in browser preview mode.
+  -->
+  <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+
+  <!-- Three.js r128 (pinned) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+  <!--
+    satellite.js v4 — SGP4/SDP4 orbit propagation in the browser.
+    The Chromecast uses this to compute satellite positions independently.
+  -->
+  <script src="https://cdn.jsdelivr.net/npm/satellite.js@4.1.4/dist/satellite.min.js"></script>
+
+  <!-- App modules (order matters: stars and astronomy must load before receiver) -->
+  <script src="js/stars.js"></script>
+  <script src="js/astronomy.js"></script>
+  <script src="js/receiver.js"></script>
+
+</body>
+</html>
