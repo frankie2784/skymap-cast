@@ -151,8 +151,34 @@ const Astro = (() => {
     };
   }
 
-  // ─── Public API ────────────────────────────────────────────────────────────
+  // ─── Alt / Az → flat fisheye (equidistant azimuthal) 2-D coordinate ───────
+  //
+  // Maps the visible hemisphere onto a unit disc — the same projection a real
+  // fisheye lens produces, and what DIY dome/wall star projectors are built
+  // around: zenith at the centre, horizon at the disc's edge, azimuth angle
+  // preserved going around it. Used by the receiver's orthographic render —
+  // see receiver.js initScene() for why a full 3-D hemisphere camera doesn't
+  // work for a projector (no perspective FOV can show a full 180° hemisphere
+  // without infinite edge distortion).
+  //
+  // @returns { x, y } in [-1, 1] — x: East positive, y: North positive.
+  //   Points below the horizon (altDeg < 0) fall outside the unit disc
+  //   (radius > 1) rather than being clipped here — callers can use that to
+  //   fade or cull them.
 
-  return { raDecToAltAz, altAzToXYZ };
+  function altAzToXY(altDeg, azDeg) {
+    const r   = (90 - altDeg) / 90;
+    const azR = rad(azDeg);
+    return {
+      x: r * Math.sin(azR),
+      y: r * Math.cos(azR),
+    };
+  }
+
+  // ─── Public API ────────────────────────────────────────────────────────────
+  // julianDay is exposed for planets.js, which needs it as the time base for
+  // planetary orbital elements — no need to duplicate the Meeus formula there.
+
+  return { raDecToAltAz, altAzToXYZ, altAzToXY, julianDay, rad, deg };
 
 })();

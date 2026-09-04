@@ -4,17 +4,54 @@
 
 ```
 skymap-cast-receiver/          ← Deploy this folder to GitHub Pages
-├── index.html                 ← Fixed: adds the #calibration-svg element
+├── index.html                 ← Adds the #calibration-svg element
+├── assets/
+│   └── planet-textures/       ← Copied from the app's own assets (+ sun_disc.webp, derived)
 ├── js/
-│   ├── receiver.js            ← State machine + homography warp + Three.js sky
-│   ├── astronomy.js           ← RA/Dec → Alt/Az coordinate math (Astro namespace)
-│   └── stars.js               ← ~220 bright stars (mag ≤ 4.5), bvToColor, magToSize
+│   ├── receiver.js            ← State machine, fisheye warp, Three.js sky, layer toggles
+│   ├── astronomy.js           ← RA/Dec → Alt/Az + fisheye projection math (Astro namespace)
+│   ├── planets.js             ← Low-precision Sun/Moon/8-planet positions + Moon phase (Planets namespace)
+│   └── stars.js               ← ~8,870 stars (mag ≤ 6.5, same asset as the app), bvToColor, magToSize
 
 androidApp/.../cast/
 ├── CastOptionsProvider.kt     ← Registers your Cast App ID with the SDK
-├── ProjectorSetupManager.kt   ← Session lifecycle + throttled message sending
-└── ProjectorSetupSheet.kt     ← Compose BottomSheet UI (2-step setup flow)
+├── ProjectorSetupManager.kt   ← Session lifecycle, message sending/receiving, layer state
+├── ProjectorSetupSheet.kt     ← Compose BottomSheet UI (2-step corner/orientation setup)
+├── ProjectorControlSheet.kt   ← Layer toggles + "Recalibrate", shown once already running
+└── CastDevicePicker.kt        ← MediaRouter-based device chooser (no AppCompat dependency)
+
+tools/
+├── generate_cast_star_catalog.py  ← Regenerates js/stars.js from the app's hygdata_v42.csv
+└── generate_cast_sun_disc.py      ← Regenerates assets/planet-textures/sun_disc.webp
 ```
+
+The receiver renders on an orthographic camera using an equidistant-azimuthal (fisheye)
+projection — a circle of sky inscribed in the frame, black in the corners, the same shape a
+real fisheye lens or DIY dome projector produces. See `Astro.altAzToXY`'s doc for why a
+perspective camera can't do this (no FOV shows a full 180° hemisphere without infinite edge
+distortion).
+
+**Parity with the phone app**: the receiver is a separate, deliberately lightweight JS
+reimplementation — not a mirror of the phone's renderer — so it can keep running after the
+phone disconnects. It currently has:
+- The **same full star catalog** the app ships (`hygdata_v42.csv`, ~8,870 stars, mag ≤ 6.5)
+  — regenerate with `tools/generate_cast_star_catalog.py` if that asset changes.
+- **Satellites**: CelesTrak `visual` + `stations` groups (narrower than the app's full
+  category system).
+- **Sun/Moon/8 planets**: Paul Schlyter's public-domain low-precision algorithm (~1 arcmin
+  accuracy — not the same engine as the phone's audited PlanetEngine). The Sun and Moon use
+  the app's own textures (`tools/generate_cast_sun_disc.py` derives the Sun's circular disc
+  asset); the Moon is phase-shaded (real crescent/gibbous shape, geometrically derived — see
+  `planets.js`'s `moonPhase()` doc comment for the math and its one documented simplification:
+  correct phase fraction and waxing/waning side, approximate terminator tilt). The other 7
+  planets stay flat colour dots — at their ~6-14px size a squished equirectangular texture
+  would just be visual noise, and some (Venus) are false-colour radar maps, not truer than a
+  hand-picked colour. Saturn gets a ring from the app's own ring texture.
+- Twinkle (per-star desynced flicker) and 1Hz continuous star-field motion (was a 60s
+  stepwise jump).
+
+Not ported: DSOs, constellations/asterisms, meteor showers, aurora, aircraft, NEOs/comets,
+the Milky Way band, light-pollution-aware magnitude limits, skyculture art.
 
 ---
 
@@ -159,7 +196,9 @@ override fun onCreateOptionsMenu(menu: Menu): Boolean {
 
 ## Message protocol
 
-Both messages use namespace `urn:x-cast:com.skymap.receiver`.
+All messages use namespace `urn:x-cast:com.skymap.receiver`. SETUP, LAYERS and STATE
+persist to `localStorage` (or echo it back) so a Chromecast reboot resumes the last
+setup on its own, without the phone reconnecting — see `receiver.js` `loadSetup()`.
 
 ### QUAD_CORNERS (live, throttled to ~20/sec)
 ```json
@@ -192,6 +231,34 @@ Both messages use namespace `urn:x-cast:com.skymap.receiver`.
 
 `azimuthOffset` = compass bearing (°) the user's phone was pointing when they tapped Done.
 The receiver rotates its star dome so that compass direction appears at the top of the image.
+
+### LAYERS (any time, including while already RUNNING)
+```json
+{
+  "type": "LAYERS",
+  "layers": { "stars": true, "planets": true, "satellites": false }
+}
+```
+Toggles which layers are drawn — the same three groupings the phone app's own HUD uses
+(`showStars` / `showPlanets` / `showSatellites`). `planets` bundles the Sun, Moon, and the
+8 planets. No recalibration needed; sent from `ProjectorControlSheet` on the phone.
+
+### STATE (receiver → phone, same namespace)
+```json
+{
+  "type": "STATE",
+  "appState": "running",
+  "lat": -37.814,
+  "lng": 144.963,
+  "azimuthOffset": 247.3,
+  "layers": { "stars": true, "planets": true, "satellites": true },
+  "event": "SETUP_APPLIED"
+}
+```
+Sent after applying SETUP/LAYERS, and whenever a phone connects — including reporting
+"already running from a persisted setup" after an unattended Chromecast reboot. The phone
+surfaces this as `ProjectorSetupManager.receiverState` and uses it to decide whether tapping
+the Cast button opens the setup flow or the layer-toggle/recalibrate controls.
 
 ---
 
