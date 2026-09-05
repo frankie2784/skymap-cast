@@ -341,6 +341,8 @@ let starsMaterial;           // its ShaderMaterial — uTime updated each frame 
 let satGroup;                 // toggled via sky.layers.satellites
 let planetGroup;               // toggled via sky.layers.planets
 let planetSprites = {};        // body name -> THREE.Sprite, built once in initScene()
+let selectionGroup, selectionRing, selectionLabel;   // mirrors the phone's tap/track selection
+let _lastSelectionName = null;   // avoids re-rasterising the label texture every SELECT tick
 let STARS = [];   // deduped catalog, populated by initScene(); read by updateStarPositions()
 
 // Stars sit on a sphere of radius SKY_RADIUS (see Astro.altAzToXYZ) — every
@@ -553,6 +555,24 @@ function initScene() {
   satGroup = new THREE.Group();
   sceneGroup.add(satGroup);
 
+  // ── Selection marker ──────────────────────────────────────────────────────
+  // Mirrors whatever's tapped/tracked on the phone (see the SELECT message) — a
+  // pulsing ring plus a name label, positioned at whatever (az, alt) the phone
+  // last reported. Built once, hidden until the first SELECT arrives.
+  selectionGroup = new THREE.Group();
+  selectionRing = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: _ringTexture('#ffe270'), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  }));
+  selectionRing.scale.set(56, 56, 1);
+  selectionLabel = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: _selectionLabelTexture, transparent: true, depthWrite: false,
+  }));
+  selectionLabel.scale.set(220, 55, 1);
+  selectionLabel.position.y = 46;   // above the ring, not centred on it
+  selectionGroup.add(selectionRing, selectionLabel);
+  selectionGroup.visible = false;
+  sceneGroup.add(selectionGroup);
+
   // ── Sun, Moon, planets ──────────────────────────────────────────────────
   // One object per body, built once here (only 9 of them — no pooling needed
   // like the variable-count satellites) and repositioned in updatePlanetPositions().
@@ -709,6 +729,34 @@ function applyAim(aim) {
   if (appState === AppState.RUNNING) applyWarp(currentCorners);
 }
 
+// Selection label — a dedicated (wider, shrink-to-fit) canvas rather than
+// _textSprite() below, which is sized for single compass letters (N/E/S/W) and
+// would clip or overflow real object names like "International Space Station".
+// One canvas/texture, mutated in place and re-uploaded on each SELECT — cheaper
+// than allocating a new texture per selection change.
+const _selectionLabelCanvas = document.createElement('canvas');
+_selectionLabelCanvas.width = 512;
+_selectionLabelCanvas.height = 128;
+const _selectionLabelCtx = _selectionLabelCanvas.getContext('2d');
+const _selectionLabelTexture = new THREE.CanvasTexture(_selectionLabelCanvas);
+
+function _updateSelectionLabelText(text) {
+  const ctx = _selectionLabelCtx;
+  const W = _selectionLabelCanvas.width, H = _selectionLabelCanvas.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffe270';
+  let fontSize = 56;
+  ctx.font = `bold ${fontSize}px monospace`;
+  while (ctx.measureText(text).width > W - 24 && fontSize > 18) {
+    fontSize -= 4;
+    ctx.font = `bold ${fontSize}px monospace`;
+  }
+  ctx.fillText(text, W / 2, H / 2);
+  _selectionLabelTexture.needsUpdate = true;
+}
+
 function _textSprite(text, color) {
   const cv = document.createElement('canvas');
   cv.width = 128; cv.height = 64;
@@ -738,6 +786,22 @@ function _dotTexture(colorHex) {
   ctx.beginPath(); ctx.arc(32, 32, 30, 0, Math.PI * 2); ctx.fill();
   const tex = new THREE.CanvasTexture(cv);
   _dotTextureCache[colorHex] = tex;
+  return tex;
+}
+
+// Open ring outline (not filled) — the selection marker, distinct from the solid
+// glow dots planets use, so a highlighted star doesn't just look like a bigger star.
+const _ringTextureCache = {};
+function _ringTexture(colorHex) {
+  if (_ringTextureCache[colorHex]) return _ringTextureCache[colorHex];
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = 64;
+  const ctx = cv.getContext('2d');
+  ctx.strokeStyle = colorHex;
+  ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.arc(32, 32, 26, 0, Math.PI * 2); ctx.stroke();
+  const tex = new THREE.CanvasTexture(cv);
+  _ringTextureCache[colorHex] = tex;
   return tex;
 }
 
@@ -1112,6 +1176,31 @@ function dispatchMessage(msg) {
       }
       break;
     }
+
+    // ── Mirrors whatever's tapped/tracked on the phone ────────────────────
+    //    Sent repeatedly (~1/sec) while something is selected, since alt/az
+    //    drifts for every object as the sky turns — this receiver has no
+    //    ephemeris of its own for an arbitrary phone-side selection, unlike
+    //    its own star/planet/satellite catalogs. `id: null` clears it.
+    case 'SELECT': {
+      if (msg.id == null || !isValidCoord(msg.azimuthDeg) || !isValidCoord(msg.altitudeDeg)) {
+        selectionGroup.visible = false;
+        break;
+      }
+      const { x, y, z } = Astro.altAzToXYZ(msg.altitudeDeg, msg.azimuthDeg);
+      // Just inside SAT_RADIUS — the frontmost tier — so the marker is never
+      // hidden behind a satellite dot occupying the same spot.
+      const SELECTION_RADIUS = SAT_RADIUS * 0.999;
+      selectionRing.position.set(x, y, z).multiplyScalar(SELECTION_RADIUS);
+      selectionLabel.position.set(x, y, z).multiplyScalar(SELECTION_RADIUS);
+      selectionLabel.position.y += 46;
+      if (msg.name && msg.name !== _lastSelectionName) {
+        _updateSelectionLabelText(msg.name);
+        _lastSelectionName = msg.name;
+      }
+      selectionGroup.visible = true;
+      break;
+    }
   }
 }
 
@@ -1197,6 +1286,10 @@ function initCastReceiver() {
     try { remaining = (ctx.getSenders() || []).length; } catch (_) {}
     anySenderConnected = remaining > 0;
     if (anySenderConnected) return;
+
+    // No phone left to keep it updated — a frozen selection marker from whenever
+    // the phone happened to disconnect would be misleading, not informative.
+    if (selectionGroup) selectionGroup.visible = false;
 
     if (appState === AppState.RUNNING) {
       setStatus('Running autonomously ✓', '', 4000);
