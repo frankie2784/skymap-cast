@@ -127,6 +127,21 @@
         fill="#4a9eff" opacity="0.95"/>
     </g>
 
+    <!--
+      Aim-calibration highlight — marks the ONE corner the phone is currently asking
+      the user to point at (see the AIM_TARGET message in receiver.js). Without this
+      there is nothing on the wall to aim at: the sky itself gives no indication of
+      where the projected rectangle's corners actually are.
+    -->
+    <g id="aim-highlight" style="display:none">
+      <circle id="aim-ring" cx="0.5" cy="0.5" r="0.05"
+        fill="rgba(255,200,60,0.18)" stroke="#ffc83c" stroke-width="4"
+        vector-effect="non-scaling-stroke">
+        <animate attributeName="r" values="0.038;0.062;0.038" dur="1.2s" repeatCount="indefinite"/>
+      </circle>
+      <circle id="aim-dot" cx="0.5" cy="0.5" r="0.008" fill="#ffc83c"/>
+    </g>
+
     <!-- Instruction text — shown while calibrating -->
     <text id="cal-instruction"
       x="0.5" y="0.93"

@@ -196,6 +196,36 @@ function showCalibrationOverlay(corners) {
 
 function hideCalibrationOverlay() {
   svgEl.style.display = 'none';
+  hideAimHighlight();
+}
+
+// Marks the single corner the phone is asking the user to point at during aim
+// calibration (see the AIM_TARGET message). The ring is deliberately large and
+// pulsing rather than a precise dot: the user is holding a phone up in front of
+// that exact spot to aim at it, so the corner itself is physically hidden behind
+// the phone — the ring stays visible around the phone's silhouette.
+function showAimHighlight(cornerKey) {
+  const corner = currentCorners[cornerKey];
+  if (!corner) return;
+  const g   = svgEl.querySelector('#aim-highlight');
+  const ring = svgEl.querySelector('#aim-ring');
+  const dot  = svgEl.querySelector('#aim-dot');
+  [ring, dot].forEach(el => {
+    el.setAttribute('cx', corner.x);
+    el.setAttribute('cy', corner.y);
+  });
+  const label = { bl: 'bottom-left', br: 'bottom-right', tl: 'top-left', tr: 'top-right' }[cornerKey] || cornerKey;
+  const instruction = svgEl.querySelector('#cal-instruction');
+  if (instruction) instruction.textContent = `Point your phone at the ${label} corner`;
+  g.style.display = 'block';
+  svgEl.style.display = 'block';
+}
+
+function hideAimHighlight() {
+  const g = svgEl.querySelector('#aim-highlight');
+  if (g) g.style.display = 'none';
+  const instruction = svgEl.querySelector('#cal-instruction');
+  if (instruction) instruction.textContent = 'Drag corners on your phone to fit the projection surface';
 }
 
 // ─── Homography warp ──────────────────────────────────────────────────────────
@@ -594,6 +624,19 @@ function applyAim(aim) {
   const vu = new THREE.Vector3().subVectors(pc, pa).normalize();   // screen up
   const vn = new THREE.Vector3().crossVectors(vr, vu).normalize(); // screen normal
 
+  // Degenerate input guard. If the three measured directions are collinear (or two
+  // land on the same spot) the cross product is the zero vector, normalize() yields
+  // NaN, and every downstream value — the whole projection matrix — becomes NaN.
+  // Three renders that as an entirely black frame with no error of any kind, which
+  // is indistinguishable from "the sky just isn't drawing". Bail out loudly instead,
+  // keeping whatever camera we had, and report it so the phone can surface it.
+  const degenerate = ![vr, vu, vn].every(v => isFinite(v.x) && isFinite(v.y) && isFinite(v.z));
+  if (degenerate) {
+    console.warn('[Receiver] Degenerate aim calibration — corners are collinear:', aim);
+    sendState({ event: 'AIM_DEGENERATE', error: 'corners collinear or coincident' });
+    return;
+  }
+
   // vn must point from the screen back toward the eye for the formulas below —
   // flip it (and vu, to keep the basis right-handed) if the measured corners
   // came out wound the other way.
@@ -989,6 +1032,18 @@ function handleMessage(_, raw) {
     return;
   }
 
+  // The receiver's own console is only reachable via remote debugging, which makes
+  // silent failures here effectively invisible. Report them back over the Cast
+  // channel so they surface in the phone's logcat instead — see sendState().
+  try {
+    dispatchMessage(msg);
+  } catch (e) {
+    console.error('[Receiver] handleMessage failed:', e);
+    sendState({ event: 'ERROR', error: `${msg && msg.type}: ${e && e.message}` });
+  }
+}
+
+function dispatchMessage(msg) {
   switch (msg.type) {
 
     // ── Live corner preview while user drags on phone ──────────────────────
@@ -1031,6 +1086,21 @@ function handleMessage(_, raw) {
       sendState({ event: 'LAYERS_APPLIED' });
       break;
     }
+
+    // ── Which corner the phone is currently asking the user to aim at ────────
+    //    Highlights that corner on the projection so there's something real to
+    //    point the phone at — the sky alone gives no clue where the projected
+    //    rectangle's corners are. `corner: null` clears the highlight.
+    case 'AIM_TARGET': {
+      if (msg.corner) {
+        appState = AppState.CALIBRATING;
+        showCalibrationOverlay(currentCorners);
+        showAimHighlight(msg.corner);
+      } else {
+        hideAimHighlight();
+      }
+      break;
+    }
   }
 }
 
@@ -1061,6 +1131,18 @@ function sendState(extra = {}) {
     lng: sky.lng,
     aim: sky.aim,
     layers: sky.layers,
+    // The Chromecast's JS console needs remote debugging to reach, so ship the
+    // values that actually explain a blank projection back to the phone, where
+    // they land in logcat. NaN/0 here localises a fault immediately.
+    diag: {
+      stars:    STARS.length,
+      camOk:    !!camera && isFinite(camera.projectionMatrix.elements[0]),
+      proj0:    camera ? camera.projectionMatrix.elements[0] : null,
+      proj5:    camera ? camera.projectionMatrix.elements[5] : null,
+      canvasW:  canvasEl.offsetWidth,
+      canvasH:  canvasEl.offsetHeight,
+      starVis:  !!starsPoints && starsPoints.visible,
+    },
     ...extra,
   };
   try {
