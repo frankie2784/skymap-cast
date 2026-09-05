@@ -661,6 +661,22 @@ function applyAim(aim) {
     return;
   }
 
+  // Homogeneous coordinates have a sign ambiguity: (x,y,w) and (-x,-y,-w) are the
+  // same 2D point after dehomogenising, so H and -H solve the exact same (u,v)
+  // correspondences equally validly. Fixing h22=1 in solveHomography() picks a
+  // SPECIFIC one of those two solutions, but nothing about that choice is tied to
+  // which one puts the calibrated patch in front of the eye (w>0) rather than
+  // behind it (w<0, clipped by WebGL as invisible) — it depends on the aim
+  // geometry and can land either way. Confirmed on real calibration data: all 4
+  // corners came out at w<0, silently discarding the entire star field with no
+  // error anywhere. Detect it against a corner and flip every entry of H — that
+  // leaves every x/w,y/w ratio (and so every rendered position) unchanged, since
+  // negating both numerator and denominator doesn't change their quotient.
+  const w0 = H[2][0] * dirs[0][0] + H[2][1] * dirs[0][1] + H[2][2] * dirs[0][2];
+  if (w0 < 0) {
+    for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) H[r][c] *= -1;
+  }
+
   // Build the 4x4 the renderer wants. Objects live at world position p = R*d,
   // and H is linear, so H*(R*d) dehomogenises to exactly H*d — the radius
   // cancels and every object lands where its direction says it should.
