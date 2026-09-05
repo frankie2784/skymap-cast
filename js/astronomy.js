@@ -85,6 +85,33 @@ const Astro = (() => {
     return (gmstDeg(date) + lngDeg + 360) % 360;
   }
 
+  // ─── Atmospheric refraction ────────────────────────────────────────────────
+  //
+  // The atmosphere bends light downward, so every celestial object *appears*
+  // higher than its true (airless) altitude — ~0.57° right at the horizon,
+  // shrinking to ~1 arcminute at 45° and ~0 at the zenith. Sæmundsson (1986),
+  // as a function of true altitude — Meeus, "Astronomical Algorithms" ch.16.
+  //
+  // Matches AtmosphericRefraction.kt (same formula/constants) on the phone,
+  // which applies this correction before sending an object's azimuthDeg/
+  // altitudeDeg over in the SELECT cast message. Without also applying it
+  // here, the receiver's own stars/planets/satellites render at their true
+  // (unrefracted) position while the SELECT ring sits at the phone's apparent
+  // (refracted) one — the two drift apart near the horizon where the effect
+  // is largest, so the ring stops looking centred on the object it's marking.
+  const REFRACTION_MIN_ALT_DEG = -5.0;   // below this the formula blows up; no correction is meaningful anyway
+
+  function refractionDeg(trueAltDeg) {
+    if (trueAltDeg < REFRACTION_MIN_ALT_DEG) return 0;
+    const argDeg = trueAltDeg + 10.3 / (trueAltDeg + 5.11);
+    const arcmin = 1.02 / Math.tan(rad(argDeg));
+    return Math.max(0, arcmin / 60);
+  }
+
+  function apparentFromTrueDeg(trueAltDeg) {
+    return Math.min(90, trueAltDeg + refractionDeg(trueAltDeg));
+  }
+
   // ─── RA / Dec → Altitude / Azimuth ────────────────────────────────────────
   //
   // Standard spherical-trig formula (Meeus ch.13).
@@ -127,7 +154,7 @@ const Astro = (() => {
     }
 
     return {
-      alt: deg(altR),
+      alt: apparentFromTrueDeg(deg(altR)),
       az:  deg(azR),
     };
   }
@@ -214,9 +241,18 @@ const Astro = (() => {
       if (Math.sin(haR) > 0) azR = 2 * Math.PI - azR;
     }
 
-    arr[idx]     =  cosAlt * Math.sin(azR) * radius;   // East
-    arr[idx + 1] =  sinAlt * radius;                    // Up
-    arr[idx + 2] = -cosAlt * Math.cos(azR) * radius;   // North
+    // Apparent (refracted) altitude — see refractionDeg()'s doc comment above.
+    // Reintroduces the asin/sin round trip this function's fast path
+    // otherwise avoids, but only once per star per tick (1/sec), not per
+    // frame — negligible next to the ~2ms/tick this already costs.
+    const trueAltDeg = deg(Math.asin(sinAlt));
+    const appAltR = rad(apparentFromTrueDeg(trueAltDeg));
+    const sinAltApp = Math.sin(appAltR);
+    const cosAltApp = Math.cos(appAltR);
+
+    arr[idx]     =  cosAltApp * Math.sin(azR) * radius;   // East
+    arr[idx + 1] =  sinAltApp * radius;                    // Up
+    arr[idx + 2] = -cosAltApp * Math.cos(azR) * radius;   // North
   }
 
   // ─── Public API ────────────────────────────────────────────────────────────
@@ -225,6 +261,9 @@ const Astro = (() => {
   // lstDeg is exposed so callers can hoist it once per tick for
   // raDecToXYZInto() instead of recomputing it per star.
 
-  return { raDecToAltAz, altAzToXYZ, altAzToXY, raDecToXYZInto, julianDay, lstDeg, rad, deg };
+  return {
+    raDecToAltAz, altAzToXYZ, altAzToXY, raDecToXYZInto, julianDay, lstDeg, rad, deg,
+    refractionDeg, apparentFromTrueDeg,
+  };
 
 })();

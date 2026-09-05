@@ -1053,7 +1053,10 @@ function propagateSatellites() {
       const look   = satellite.ecfToLookAngles(obs, ecf);
       const altDeg = look.elevation * (180 / Math.PI);
       if (altDeg < CONFIG.MIN_SAT_ALT_DEG) continue;
-      visible.push({ alt: altDeg, az: look.azimuth * (180 / Math.PI) });
+      // Apparent (refracted) altitude — see astronomy.js's refractionDeg() doc
+      // comment: keeps a tracked satellite's dot aligned with the SELECT ring,
+      // which mirrors the phone's already-refracted azimuthDeg/altitudeDeg.
+      visible.push({ alt: Astro.apparentFromTrueDeg(altDeg), az: look.azimuth * (180 / Math.PI) });
     } catch (_) {}
   }
   _updateSatSprites(visible);
