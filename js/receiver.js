@@ -1383,7 +1383,7 @@ function initCastReceiver() {
     sendState({ event: 'SENDER_CONNECTED' });
   });
 
-  ctx.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, () => {
+  ctx.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, e => {
     // Only truly disconnected once no senders remain — one session's second sender
     // (Play Services) dropping must not silence replies to the app's own sender,
     // nor make the projector announce it's been left alone while the phone is
@@ -1392,6 +1392,24 @@ function initCastReceiver() {
     try { remaining = (ctx.getSenders() || []).length; } catch (_) {}
     anySenderConnected = remaining > 0;
     if (anySenderConnected) return;
+
+    // The user explicitly hit "Stop casting" — from SkyMap's own projector sheet, the
+    // stock Cast dialog, or the system Cast notification. Only the first of those sends
+    // our custom STOP message, and disableIdleTimeout (set above) stops the platform
+    // closing us on its own, so this reason code is the one signal every explicit-stop
+    // path shares. Without it, "stop casting" on the phone left the projector happily
+    // running the sky with no session and no way to reach it short of unplugging.
+    //
+    // Every other reason (ERROR / UNKNOWN — phone slept, lost WiFi, or was killed) is an
+    // *implicit* drop and deliberately leaves the projector running autonomously, which is
+    // the whole point of disableIdleTimeout.
+    const REQUESTED = cast.framework.system.DisconnectReason.REQUESTED_BY_SENDER;
+    if (e && e.reason === REQUESTED) {
+      console.info('[Receiver] Sender requested disconnect — shutting down');
+      setStatus('Casting stopped', '', 0);
+      try { ctx.stop(); } catch (err) { console.warn('[Receiver] stop failed:', err); }
+      return;
+    }
 
     // No phone left to keep it updated — a frozen selection marker from whenever
     // the phone happened to disconnect would be misleading, not informative.
