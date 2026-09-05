@@ -5,7 +5,7 @@
  * State machine:
  *   WAITING       → waiting for phone to connect
  *   CALIBRATING   → showing adjustable quad; phone is dragging corners
- *   RUNNING       → sky rendered inside the calibrated quad; phone disconnected
+ *   RUNNING       → sky rendered inside the warped quad; phone disconnected
  *
  * Messages accepted:
  *   QUAD_CORNERS  { corners: {tl,tr,br,bl} }   live corner updates while dragging
@@ -15,17 +15,22 @@
  * Two independent calibrations compose to produce the final image:
  *   1. `aim` — four real-world (azimuth, altitude) directions, measured by
  *      physically pointing the phone at each corner of the light hitting the
- *      wall/ceiling from the viewer's actual seat. Determines the camera's
- *      viewing direction, up vector, and field of view (see applyAim()).
+ *      wall/ceiling from the viewer's actual seat. Determines the exact
+ *      direction -> image homography (see applyAim()), so the rendered image
+ *      is what that flat surface would really look like as a window onto the
+ *      sky, not a fisheye dome. All four are needed: three corners cannot
+ *      determine the shape, since angles alone carry no distance.
  *   2. `corners` — normalised 0–1 screen-space quad, unchanged from before.
- *      Used as a clipping boundary after a uniform scale, so it never distorts
- *      the sky or selected-object overlays.
+ *      Applied afterwards as a CSS homographic warp, purely to correct the
+ *      *projector's own* keystone (mounted off-angle) or to confine the sky
+ *      to only part of the projector's full output frame. Orthogonal to (1):
+ *      this never affects which sky direction maps to which pixel, only
+ *      where that already-correct rectangular image physically lands.
  *
  * Corner coordinates are normalised 0–1 (x: left=0, right=1; y: top=0, bot=1).
  *
  * After SETUP the receiver:
- *   1. Calibrates a conventional camera from `aim`, then places and clips it
- *      using `corners`.
+ *   1. Builds the camera homography from `aim`, then applies the `corners` warp.
  *   2. Downloads TLEs from CelesTrak and runs SGP4 every 5s.
  *   3. Recomputes star positions every 1s.
  *   4. Refreshes TLEs every 2h.
@@ -49,7 +54,9 @@ const CONFIG = {
   // continuous motion instead.
   STAR_UPDATE_MS:     1_000,
   MIN_SAT_ALT_DEG:   -5,
-  // Radius (arbitrary world units) of the sphere every sky object is placed on.
+  // Radius (arbitrary world units) of the sphere every sky object is placed
+  // on. Absolute scale doesn't matter — applyAim()'s homography is linear, so
+  // the radius cancels when the clip coordinates are dehomogenised.
   SKY_RADIUS:         900,
   CAST_NAMESPACE:     'urn:x-cast:com.skymap.receiver',
 };
@@ -227,6 +234,66 @@ function hideAimHighlight() {
 // After setup the canvas is uniformly scaled into the calibrated bounds, then
 // clipped to the user-defined quad. A projective CSS warp would make the sky,
 // selected-object rings, and labels visibly stretch near the quad edges.
+
+function gaussElim(A, b) {
+  const n = A.length;
+  const M = A.map((row, i) => [...row, b[i]]);
+
+  for (let col = 0; col < n; col++) {
+    let maxRow = col;
+    for (let row = col + 1; row < n; row++) {
+      if (Math.abs(M[row][col]) > Math.abs(M[maxRow][col])) maxRow = row;
+    }
+    [M[col], M[maxRow]] = [M[maxRow], M[col]];
+
+    const pivot = M[col][col];
+    if (Math.abs(pivot) < 1e-10) continue;
+
+    for (let row = col + 1; row < n; row++) {
+      const f = M[row][col] / pivot;
+      for (let j = col; j <= n; j++) M[row][j] -= f * M[col][j];
+    }
+  }
+
+  const x = new Array(n).fill(0);
+  for (let i = n - 1; i >= 0; i--) {
+    x[i] = M[i][n] / M[i][i];
+    for (let k = i - 1; k >= 0; k--) M[k][n] -= M[k][i] * x[i];
+  }
+  return x;
+}
+
+function computeHomography(src, dst) {
+  const A = [], b = [];
+  for (let i = 0; i < 4; i++) {
+    const { x: sx, y: sy } = src[i];
+    const { x: dx, y: dy } = dst[i];
+    A.push([sx, sy, 1,  0,  0, 0, -dx * sx, -dx * sy]);
+    b.push(dx);
+    A.push([ 0,  0, 0, sx, sy, 1, -dy * sx, -dy * sy]);
+    b.push(dy);
+  }
+  const h = gaussElim(A, b);
+  return [
+    [h[0], h[1], h[2]],
+    [h[3], h[4], h[5]],
+    [h[6], h[7], 1   ],
+  ];
+}
+
+function homographyToCssMatrix3d(H) {
+  const [
+    [a, b, c],
+    [d, e, f],
+    [g, h, i],
+  ] = H;
+  return [
+    a, d, 0, g,
+    b, e, 0, h,
+    0, 0, 1, 0,
+    c, f, 0, i,
+  ].map(v => v.toFixed(8)).join(',');
+}
 
 function applyWarp(corners) {
   const W = window.innerWidth;
@@ -533,7 +600,7 @@ function initScene() {
 
   window.addEventListener('resize', () => {
     if (sky.aim) {
-      applyAim(sky.aim);   // updates the camera and output placement
+      applyAim(sky.aim);   // re-fits canvas sizing + re-applies the corners warp
     } else {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
@@ -542,54 +609,128 @@ function initScene() {
   });
 }
 
-// ─── Perspective camera from four aimed corners ───────────────────────────────
+// ─── Perspective camera from a 4-corner homography ───────────────────────────
 //
-// The average ray establishes the optical axis. Averaged opposing edges give a
-// stable horizontal axis, while the largest angular extent sets an FOV that
-// contains every measured corner without distorting billboard sprites.
+// Maps sky DIRECTIONS to image coordinates using the exact projective map
+// determined by the four measured corner directions. For any planar surface
+// viewed from a point, direction -> image is exactly a homography (a 3x3
+// projective map), so four corner correspondences determine it completely —
+// with no knowledge of distances and no assumption that the surface is a
+// rectangle, only that it's flat.
+//
+// WHY NOT KOOIMA'S OFF-AXIS FRUSTUM (what this used to do)?
+// That algorithm needs the screen's real 3D corner POINTS, and takes
+// (br-bl) ⊥ (tl-bl) as given. All we can measure with a compass is
+// DIRECTIONS — angles carry no distance — so the old code placed all three
+// corners at the same radius. But a real rectangle viewed off-axis has its
+// corners at genuinely different distances, so equal-radius placement warps
+// it into a non-rectangular patch: measured on real calibration data the
+// basis came out 110° instead of 90°, and the resulting frustum pointed
+// 10-13° away from the corners the user actually aimed at. Verified against
+// a synthetic perfect rectangle with perfect sensors, the approximation alone
+// introduced ~6° of skew — it was never a sensor-accuracy problem.
+//
+// The 4th corner is what makes this exact: 4 correspondences x 2 coordinates
+// = the 8 degrees of freedom of a homography. Three corners genuinely cannot
+// determine the shape, which is why the old approach had to invent the
+// missing constraint and got it wrong.
 function applyAim(aim) {
-  const corners = {};
-  for (const key of ['bl', 'br', 'tl', 'tr']) {
-    const { x, y, z } = Astro.altAzToXYZ(aim[key].alt, aim[key].az);
-    corners[key] = new THREE.Vector3(x, y, z).normalize();
-  }
+  const dirs = ['bl', 'br', 'tl', 'tr'].map(k => {
+    const { x, y, z } = Astro.altAzToXYZ(aim[k].alt, aim[k].az);
+    return [x, y, z];
+  });
+  // Image-space targets, in NDC: the rendered frame's own corners.
+  const targets = [[-1, -1], [1, -1], [-1, 1], [1, 1]];
 
-  const forward = new THREE.Vector3()
-    .add(corners.bl).add(corners.br).add(corners.tl).add(corners.tr).normalize();
-  const right = new THREE.Vector3()
-    .add(corners.tr).add(corners.br).sub(corners.tl).sub(corners.bl);
-  right.addScaledVector(forward, -right.dot(forward)).normalize();
-  const up = new THREE.Vector3().crossVectors(right, forward).normalize();
-  const directions = Object.values(corners);
-
-  if (forward.lengthSq() < 1e-12 || right.lengthSq() < 1e-12 || up.lengthSq() < 1e-12 ||
-      directions.some(direction => direction.dot(forward) <= 0)) {
-    console.warn('[Receiver] Degenerate aim calibration:', aim);
-    sendState({ event: 'AIM_DEGENERATE', error: 'corner directions are invalid' });
+  const H = solveHomography(dirs, targets);
+  if (!H) {
+    console.warn('[Receiver] Degenerate aim calibration — cannot solve homography:', aim);
+    sendState({ event: 'AIM_DEGENERATE', error: 'corners collinear or coincident' });
     return;
   }
 
-  const halfHorizontalFov = Math.max(...directions.map(direction =>
-    Math.atan2(Math.abs(direction.dot(right)), direction.dot(forward)),
-  ));
-  const halfVerticalFov = Math.max(...directions.map(direction =>
-    Math.atan2(Math.abs(direction.dot(up)), direction.dot(forward)),
-  ));
-  const aspect = window.innerWidth / window.innerHeight;
-  const verticalFov = 2 * Math.max(
-    halfVerticalFov,
-    Math.atan(Math.tan(halfHorizontalFov) / aspect),
+  // Homogeneous coordinates have a sign ambiguity: (x,y,w) and (-x,-y,-w) are the
+  // same 2D point after dehomogenising, so H and -H solve the exact same (u,v)
+  // correspondences equally validly. Fixing h22=1 in solveHomography() picks a
+  // SPECIFIC one of those two solutions, but nothing about that choice is tied to
+  // which one puts the calibrated patch in front of the eye (w>0) rather than
+  // behind it (w<0, clipped by WebGL as invisible) — it depends on the aim
+  // geometry and can land either way. Confirmed on real calibration data: all 4
+  // corners came out at w<0, silently discarding the entire star field with no
+  // error anywhere. Detect it against a corner and flip every entry of H — that
+  // leaves every x/w,y/w ratio (and so every rendered position) unchanged, since
+  // negating both numerator and denominator doesn't change their quotient.
+  const w0 = H[2][0] * dirs[0][0] + H[2][1] * dirs[0][1] + H[2][2] * dirs[0][2];
+  if (w0 < 0) {
+    for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) H[r][c] *= -1;
+  }
+
+  // Build the 4x4 the renderer wants. Objects live at world position p = R*d,
+  // and H is linear, so H*(R*d) dehomogenises to exactly H*d — the radius
+  // cancels and every object lands where its direction says it should.
+  //   clip.x = H0·p,  clip.y = H1·p,  clip.w = H2·p
+  // clip.z is left at 0 (so NDC z = 0, mid-range and always inside the depth
+  // clip): nothing here writes depth — every material is transparent with
+  // depthWrite:false and relies on draw order — so there's no depth precision
+  // to preserve. Points behind the surface plane get clip.w < 0 and are
+  // clipped by the GPU, which is the behaviour we want.
+  camera.matrixAutoUpdate = false;
+  camera.matrix.identity();          // H maps world directions directly; no view transform
+  camera.matrixWorldNeedsUpdate = true;
+  camera.projectionMatrix.set(
+    H[0][0], H[0][1], H[0][2], 0,
+    H[1][0], H[1][1], H[1][2], 0,
+    0,       0,       0,       0,
+    H[2][0], H[2][1], H[2][2], 0,
   );
 
-  camera.matrixAutoUpdate = true;
-  camera.position.set(0, 0, 0);
-  camera.up.copy(up);
-  camera.lookAt(forward);
-  camera.aspect = aspect;
-  camera.fov = THREE.MathUtils.radToDeg(verticalFov);
-  camera.updateProjectionMatrix();
+  // Three derives its culling frustum from the projection matrix, which this
+  // deliberately non-standard one breaks. Nothing here is expensive enough to
+  // need culling (one Points cloud, ~10 sprites, a line loop), so switch it
+  // off wholesale rather than have objects vanish for the wrong reasons — the
+  // star field already had to do this, see initScene().
+  scene.traverse(o => { o.frustumCulled = false; });
+
+  // The homography maps the aimed quad onto the full NDC square, so the render
+  // fills the canvas. applyWarp() then uniformly places and clips that canvas
+  // to the user's dragged output quad. Canvas therefore tracks the window.
   renderer.setSize(window.innerWidth, window.innerHeight);
   if (appState === AppState.RUNNING) applyWarp(currentCorners);
+}
+
+// Solves the 3x3 H with H[2][2] fixed to 1 (8 unknowns) such that, for each
+// correspondence, dehomogenise(H · dir) == target. Straight Gaussian
+// elimination with partial pivoting on the 8x8 system; returns null if the
+// system is singular, which means the measured directions are degenerate
+// (collinear, or two captures landing on the same spot).
+function solveHomography(dirs, targets) {
+  const N = 8;
+  const M = [];
+  for (let i = 0; i < 4; i++) {
+    const [dx, dy, dz] = dirs[i];
+    const [u, v] = targets[i];
+    M.push([dx, dy, dz, 0, 0, 0, -u * dx, -u * dy, u * dz]);
+    M.push([0, 0, 0, dx, dy, dz, -v * dx, -v * dy, v * dz]);
+  }
+  for (let c = 0; c < N; c++) {
+    let piv = c;
+    for (let r = c + 1; r < N; r++) if (Math.abs(M[r][c]) > Math.abs(M[piv][c])) piv = r;
+    if (Math.abs(M[piv][c]) < 1e-12) return null;
+    [M[c], M[piv]] = [M[piv], M[c]];
+    for (let r = 0; r < N; r++) {
+      if (r === c) continue;
+      const f = M[r][c] / M[c][c];
+      if (!f) continue;
+      for (let k = c; k <= N; k++) M[r][k] -= f * M[c][k];
+    }
+  }
+  const h = [];
+  for (let i = 0; i < N; i++) {
+    const v = M[i][N] / M[i][i];
+    if (!isFinite(v)) return null;
+    h.push(v);
+  }
+  return [[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], 1]];
 }
 
 // Selection label — a dedicated (wider, shrink-to-fit) canvas rather than
