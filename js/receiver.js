@@ -148,6 +148,8 @@ function loadSetup() {
 // ─── DOM refs ─────────────────────────────────────────────────────────────────
 
 const canvasEl  = document.getElementById('sky');
+const selectionCanvasEl = document.getElementById('selection-overlay');
+const selectionCtx = selectionCanvasEl.getContext('2d');
 const svgEl     = document.getElementById('calibration-svg');
 const statusEl  = document.getElementById('status');
 const detailEl  = document.getElementById('detail');
@@ -295,6 +297,14 @@ function homographyToCssMatrix3d(H) {
   ].map(v => v.toFixed(8)).join(',');
 }
 
+// Keeps the 2D selection-marker canvas pixel-for-pixel aligned with the WebGL
+// canvas — same backing resolution, so drawSelectionOverlay()'s NDC->pixel
+// math lands in the same coordinate frame applyWarp() then transforms below.
+function resizeSelectionCanvas() {
+  selectionCanvasEl.width = window.innerWidth;
+  selectionCanvasEl.height = window.innerHeight;
+}
+
 function applyWarp(corners) {
   const W = window.innerWidth;
   const H = window.innerHeight;
@@ -315,9 +325,14 @@ function applyWarp(corners) {
     const y = ((point.y * H - offsetY) / scale / H) * 100;
     return `${x.toFixed(4)}% ${y.toFixed(4)}%`;
   });
-  canvasEl.style.transformOrigin = '0px 0px';
-  canvasEl.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${scale})`;
-  canvasEl.style.clipPath = `polygon(${clipPoints.join(', ')})`;
+  // Selection overlay gets the exact same isotropic transform/clip as the sky
+  // canvas, so a marker drawn as a true circle in canvas-pixel space stays a
+  // true circle after this uniform (non-projective) scale is applied.
+  for (const el of [canvasEl, selectionCanvasEl]) {
+    el.style.transformOrigin = '0px 0px';
+    el.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${scale})`;
+    el.style.clipPath = `polygon(${clipPoints.join(', ')})`;
+  }
   console.log('[Warp] Uniform scale and clip applied');
 }
 
@@ -330,8 +345,6 @@ let starsMaterial;           // its ShaderMaterial — uTime updated each frame 
 let satGroup;                 // toggled via sky.layers.satellites
 let planetGroup;               // toggled via sky.layers.planets
 let planetSprites = {};        // body name -> THREE.Sprite, built once in initScene()
-let selectionGroup, selectionRing, selectionLabel;   // mirrors the phone's tap/track selection
-let _lastSelectionName = null;   // avoids re-rasterising the label texture every SELECT tick
 let STARS = [];   // deduped catalog, populated by initScene(); read by updateStarPositions()
 
 // Stars sit on a sphere of radius SKY_RADIUS (see Astro.altAzToXYZ) — every
@@ -439,6 +452,7 @@ function initScene() {
   renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setClearColor(0x000000, 1);
+  resizeSelectionCanvas();
 
   scene      = new THREE.Scene();
   sceneGroup = new THREE.Group();
@@ -544,24 +558,6 @@ function initScene() {
   satGroup = new THREE.Group();
   sceneGroup.add(satGroup);
 
-  // ── Selection marker ──────────────────────────────────────────────────────
-  // Mirrors whatever's tapped/tracked on the phone (see the SELECT message) — a
-  // pulsing ring plus a name label, positioned at whatever (az, alt) the phone
-  // last reported. Built once, hidden until the first SELECT arrives.
-  selectionGroup = new THREE.Group();
-  selectionRing = new THREE.Sprite(new THREE.SpriteMaterial({
-    map: _ringTexture('#ffe270'), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
-  }));
-  selectionRing.scale.set(56, 56, 1);
-  selectionLabel = new THREE.Sprite(new THREE.SpriteMaterial({
-    map: _selectionLabelTexture, transparent: true, depthWrite: false,
-  }));
-  selectionLabel.scale.set(220, 55, 1);
-  selectionLabel.position.y = 46;   // above the ring, not centred on it
-  selectionGroup.add(selectionRing, selectionLabel);
-  selectionGroup.visible = false;
-  sceneGroup.add(selectionGroup);
-
   // ── Sun, Moon, planets ──────────────────────────────────────────────────
   // One object per body, built once here (only 9 of them — no pooling needed
   // like the variable-count satellites) and repositioned in updatePlanetPositions().
@@ -599,6 +595,7 @@ function initScene() {
   applyLayerVisibility();
 
   window.addEventListener('resize', () => {
+    resizeSelectionCanvas();
     if (sky.aim) {
       applyAim(sky.aim);   // re-fits canvas sizing + re-applies the corners warp
     } else {
@@ -695,6 +692,7 @@ function applyAim(aim) {
   // fills the canvas. applyWarp() then uniformly places and clips that canvas
   // to the user's dragged output quad. Canvas therefore tracks the window.
   renderer.setSize(window.innerWidth, window.innerHeight);
+  resizeSelectionCanvas();
   if (appState === AppState.RUNNING) applyWarp(currentCorners);
 }
 
@@ -733,32 +731,78 @@ function solveHomography(dirs, targets) {
   return [[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], 1]];
 }
 
-// Selection label — a dedicated (wider, shrink-to-fit) canvas rather than
-// _textSprite() below, which is sized for single compass letters (N/E/S/W) and
-// would clip or overflow real object names like "International Space Station".
-// One canvas/texture, mutated in place and re-uploaded on each SELECT — cheaper
-// than allocating a new texture per selection change.
-const _selectionLabelCanvas = document.createElement('canvas');
-_selectionLabelCanvas.width = 512;
-_selectionLabelCanvas.height = 128;
-const _selectionLabelCtx = _selectionLabelCanvas.getContext('2d');
-const _selectionLabelTexture = new THREE.CanvasTexture(_selectionLabelCanvas);
+// ── Selection marker (2D overlay) ───────────────────────────────────────────
+//
+// Mirrors whatever's tapped/tracked on the phone (see the SELECT message): a
+// ring plus a name label at whatever (az, alt) the phone last reported.
+//
+// This used to be a pair of THREE.Sprite billboards living in the 3D scene,
+// positioned at the selected direction. That looked fine under the old
+// symmetric preview camera, but breaks under applyAim()'s real calibration:
+// a Sprite's quad is a fixed-size offset added in *world* space, then the
+// whole (center + offset) is run through camera.projectionMatrix in one
+// matrix multiply. That projection matrix is a general homography fitted to
+// the physical (often off-axis, non-rectangular) projection quad — for an
+// arbitrary homography, unlike a plain symmetric perspective matrix, the
+// local Jacobian is not conformal, so it scales/shears x and y differently
+// depending on screen position. The fixed square offset came out as a
+// stretched ellipse and slanted text, worst near the quad's edges/corners —
+// exactly where a tracked object tends to drift to.
+//
+// A single point, in contrast, is never distorted by projecting it — only
+// shapes (quads) are, because distortion is about how a matrix's Jacobian
+// varies *across* an extended region. So: project just the selection's
+// center through the same camera matrix used for everything else, then draw
+// a fixed-pixel circle and upright text directly in 2D on a canvas layered
+// over the WebGL one (see #selection-overlay in index.html and
+// resizeSelectionCanvas()/applyWarp() for how it stays aligned).
+let selection = { visible: false, azDeg: 0, altDeg: 0, name: '' };
 
-function _updateSelectionLabelText(text) {
-  const ctx = _selectionLabelCtx;
-  const W = _selectionLabelCanvas.width, H = _selectionLabelCanvas.height;
-  ctx.clearRect(0, 0, W, H);
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillStyle = '#ffe270';
-  let fontSize = 56;
-  ctx.font = `bold ${fontSize}px monospace`;
-  while (ctx.measureText(text).width > W - 24 && fontSize > 18) {
-    fontSize -= 4;
-    ctx.font = `bold ${fontSize}px monospace`;
+function projectToScreen(azDeg, altDeg) {
+  const { x, y, z } = Astro.altAzToXYZ(altDeg, azDeg);
+  // Magnitude doesn't matter here — same reasoning as applyAim()'s comment on
+  // SKY_RADIUS cancelling: scaling p before a projective transform scales
+  // clip.xy and clip.w by the same factor, leaving x/w, y/w unchanged.
+  const p = new THREE.Vector4(x, y, z, 1)
+    .applyMatrix4(camera.matrixWorldInverse)
+    .applyMatrix4(camera.projectionMatrix);
+  if (p.w <= 0) return null;   // behind the calibrated surface — a real GPU would clip it too
+  return {
+    x: (p.x / p.w * 0.5 + 0.5) * selectionCanvasEl.width,
+    y: (1 - (p.y / p.w * 0.5 + 0.5)) * selectionCanvasEl.height,
+  };
+}
+
+function drawSelectionOverlay() {
+  selectionCtx.clearRect(0, 0, selectionCanvasEl.width, selectionCanvasEl.height);
+  if (!selection.visible) return;
+  const pt = projectToScreen(selection.azDeg, selection.altDeg);
+  if (!pt) return;
+
+  selectionCtx.save();
+  selectionCtx.globalCompositeOperation = 'lighter';
+  selectionCtx.strokeStyle = '#ffe270';
+  selectionCtx.lineWidth = 3;
+  selectionCtx.beginPath();
+  selectionCtx.arc(pt.x, pt.y, 28, 0, Math.PI * 2);
+  selectionCtx.stroke();
+  selectionCtx.restore();
+
+  if (selection.name) {
+    selectionCtx.save();
+    selectionCtx.fillStyle = '#ffe270';
+    selectionCtx.textAlign = 'center';
+    selectionCtx.textBaseline = 'middle';
+    const maxWidth = Math.min(320, selectionCanvasEl.width - 24);
+    let fontSize = 28;
+    selectionCtx.font = `bold ${fontSize}px monospace`;
+    while (selectionCtx.measureText(selection.name).width > maxWidth && fontSize > 12) {
+      fontSize -= 2;
+      selectionCtx.font = `bold ${fontSize}px monospace`;
+    }
+    selectionCtx.fillText(selection.name, pt.x, pt.y - 46);
+    selectionCtx.restore();
   }
-  ctx.fillText(text, W / 2, H / 2);
-  _selectionLabelTexture.needsUpdate = true;
 }
 
 function _textSprite(text, color) {
@@ -790,22 +834,6 @@ function _dotTexture(colorHex) {
   ctx.beginPath(); ctx.arc(32, 32, 30, 0, Math.PI * 2); ctx.fill();
   const tex = new THREE.CanvasTexture(cv);
   _dotTextureCache[colorHex] = tex;
-  return tex;
-}
-
-// Open ring outline (not filled) — the selection marker, distinct from the solid
-// glow dots planets use, so a highlighted star doesn't just look like a bigger star.
-const _ringTextureCache = {};
-function _ringTexture(colorHex) {
-  if (_ringTextureCache[colorHex]) return _ringTextureCache[colorHex];
-  const cv = document.createElement('canvas');
-  cv.width = cv.height = 64;
-  const ctx = cv.getContext('2d');
-  ctx.strokeStyle = colorHex;
-  ctx.lineWidth = 4;
-  ctx.beginPath(); ctx.arc(32, 32, 26, 0, Math.PI * 2); ctx.stroke();
-  const tex = new THREE.CanvasTexture(cv);
-  _ringTextureCache[colorHex] = tex;
   return tex;
 }
 
@@ -1066,6 +1094,7 @@ function animate() {
   }
   if (starsMaterial) starsMaterial.uniforms.uTime.value = (performance.now() - _clockStart) / 1000;
   renderer.render(scene, camera);
+  drawSelectionOverlay();
 }
 
 // Shared by the SETUP message handler and the boot-time localStorage restore
@@ -1188,21 +1217,15 @@ function dispatchMessage(msg) {
     //    its own star/planet/satellite catalogs. `id: null` clears it.
     case 'SELECT': {
       if (msg.id == null || !isValidCoord(msg.azimuthDeg) || !isValidCoord(msg.altitudeDeg)) {
-        selectionGroup.visible = false;
+        selection.visible = false;
         break;
       }
-      const { x, y, z } = Astro.altAzToXYZ(msg.altitudeDeg, msg.azimuthDeg);
-      // Just inside SAT_RADIUS — the frontmost tier — so the marker is never
-      // hidden behind a satellite dot occupying the same spot.
-      const SELECTION_RADIUS = SAT_RADIUS * 0.999;
-      selectionRing.position.set(x, y, z).multiplyScalar(SELECTION_RADIUS);
-      selectionLabel.position.set(x, y, z).multiplyScalar(SELECTION_RADIUS);
-      selectionLabel.position.y += 46;
-      if (msg.name && msg.name !== _lastSelectionName) {
-        _updateSelectionLabelText(msg.name);
-        _lastSelectionName = msg.name;
-      }
-      selectionGroup.visible = true;
+      selection = {
+        visible: true,
+        azDeg: msg.azimuthDeg,
+        altDeg: msg.altitudeDeg,
+        name: msg.name || '',
+      };
       break;
     }
   }
@@ -1296,7 +1319,7 @@ function initCastReceiver() {
 
     // No phone left to keep it updated — a frozen selection marker from whenever
     // the phone happened to disconnect would be misleading, not informative.
-    if (selectionGroup) selectionGroup.visible = false;
+    selection.visible = false;
 
     if (appState === AppState.RUNNING) {
       setStatus('Running autonomously ✓', '', 4000);

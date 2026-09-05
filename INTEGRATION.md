@@ -3,7 +3,7 @@
 ## What was built
 
 ```
-skymap-cast-receiver/          ← Deploy this folder to GitHub Pages
+skymap-cast/          ← Deploy this folder to GitHub Pages
 ├── index.html                 ← Adds the #calibration-svg element
 ├── assets/
 │   └── planet-textures/       ← Copied from the app's own assets (+ sun_disc.webp, derived)
@@ -59,9 +59,9 @@ the Milky Way band, light-pollution-aware magnitude limits, skyculture art.
 
 ```bash
 # From the repo root:
-git subtree push --prefix skymap-cast-receiver origin gh-pages
-# Then enable Pages in GitHub repo settings → Pages → Branch: gh-pages / root
-# Your receiver URL will be: https://<you>.github.io/<repo>/
+git push skymap-cast origin main
+# Then enable Pages in GitHub repo settings → Pages → Branch: / root
+# Your receiver URL will be: https://frankie2784.github.io/skymap-cast/
 ```
 
 ---
@@ -267,7 +267,7 @@ the Cast button opens the setup flow or the layer-toggle/recalibrate controls.
 Open `index.html` locally (a local server is needed due to CORS on the CDN scripts):
 
 ```bash
-cd skymap-cast-receiver
+cd ../skymap-cast
 python3 -m http.server 8080
 # Open http://localhost:8080
 ```
