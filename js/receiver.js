@@ -1252,6 +1252,9 @@ function sendState(extra = {}) {
     lat: sky.lat,
     lng: sky.lng,
     aim: sky.aim,
+    // Lets the phone's recalibration flow start from the saved shape instead of
+    // resetting to a default every time — see ProjectorSetupSheet's corners seed.
+    corners: currentCorners,
     layers: sky.layers,
     // The Chromecast's JS console needs remote debugging to reach, so ship the
     // values that actually explain a blank projection back to the phone, where
