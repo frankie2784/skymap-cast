@@ -513,13 +513,15 @@ function initScene() {
   });
 }
 
-// Fits the DOME_R-radius fisheye disc entirely within the viewport ("contain"
-// sizing) regardless of aspect ratio, rather than stretching it — a circle of
-// sky, letterboxed in black on whichever axis is longer.
+// Fills the entire viewport with the fisheye disc ("cover" sizing) regardless
+// of aspect ratio, rather than showing the whole circle letterboxed in black
+// on the longer axis. This crops the disc's edges (near-horizon sky) on
+// whichever axis is shorter — the projector's rectangle is fully covered by
+// sky instead of showing a circular "dome" with black bars/corners.
 function updateCameraFrustum() {
   const aspect = window.innerWidth / window.innerHeight;
-  const halfW  = aspect >= 1 ? CONFIG.DOME_R * aspect : CONFIG.DOME_R;
-  const halfH  = aspect >= 1 ? CONFIG.DOME_R : CONFIG.DOME_R / aspect;
+  const halfW  = aspect >= 1 ? CONFIG.DOME_R : CONFIG.DOME_R * aspect;
+  const halfH  = aspect >= 1 ? CONFIG.DOME_R / aspect : CONFIG.DOME_R;
   camera.left = -halfW; camera.right = halfW;
   camera.top  = halfH;  camera.bottom = -halfH;
   camera.updateProjectionMatrix();
