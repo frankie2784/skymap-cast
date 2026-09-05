@@ -65,19 +65,25 @@
       </radialGradient>
     </defs>
 
-    <!-- Faint blue fill inside the quad -->
+    <!-- Faint blue fill inside the quad.
+         stroke-width is in real pixels, not viewBox units — vector-effect="non-scaling-stroke"
+         makes the SVG spec measure it in the pre-viewBox-transform coordinate system (i.e. actual
+         screen pixels), so the "0.003"/"0.004" values previously here rendered as ~0.003px lines:
+         invisible on a projector. Only the corner dots showed, since their circles are sized by
+         `r` (scaled normally by the viewBox, so it comes out as real visible pixels) rather than
+         by their stroke. -->
     <polygon id="cal-poly"
       points="0.15,0.20 0.85,0.20 0.85,0.80 0.15,0.80"
-      fill="rgba(30,80,200,0.08)"
-      stroke="rgba(74,158,255,0.6)"
-      stroke-width="0.003"
+      fill="rgba(30,80,200,0.16)"
+      stroke="rgba(74,158,255,0.85)"
+      stroke-width="3"
       vector-effect="non-scaling-stroke"/>
 
     <!-- Top edge — highlighted to show orientation reference -->
     <line id="cal-top-edge"
       x1="0.15" y1="0.20" x2="0.85" y2="0.20"
-      stroke="rgba(74,158,255,0.9)"
-      stroke-width="0.004"
+      stroke="rgba(74,158,255,0.95)"
+      stroke-width="5"
       vector-effect="non-scaling-stroke"/>
 
     <!-- Corner draggable markers (phone controls these) -->

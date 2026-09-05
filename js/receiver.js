@@ -855,10 +855,13 @@ function handleMessage(_, raw) {
     case 'QUAD_CORNERS': {
       if (!msg.corners) return;
       currentCorners = msg.corners;
-      if (appState !== AppState.RUNNING) {
-        appState = AppState.CALIBRATING;
-        showCalibrationOverlay(currentCorners);
-      }
+      // Always show the overlay, even if we were already RUNNING — this is the
+      // recalibration path (ProjectorControlSheet's "Recalibrate projection"),
+      // and previously the RUNNING guard here meant re-entering setup on an
+      // already-projecting receiver silently updated currentCorners with no
+      // visible feedback at all until a final SETUP was sent.
+      appState = AppState.CALIBRATING;
+      showCalibrationOverlay(currentCorners);
       break;
     }
 
