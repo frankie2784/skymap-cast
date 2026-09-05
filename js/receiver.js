@@ -506,6 +506,17 @@ function initScene() {
     transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
   });
   starsPoints = new THREE.Points(geo, starsMaterial);
+  // Never frustum-cull the star field. Three computes a geometry's bounding sphere
+  // once, lazily, on the first render — which happens at boot while this buffer is
+  // still all zeros (positions aren't filled until a SETUP supplies lat/lng), giving
+  // a permanently cached sphere of radius 0 at the origin. Updating the position
+  // attribute does NOT invalidate it. The old orthographic camera didn't care (the
+  // origin was well inside its frustum), but the perspective camera sits AT the
+  // origin with near=1, so that zero-radius sphere falls behind the near plane and
+  // the whole star field is culled every frame — a black sky, with the object still
+  // reporting visible:true. The star sphere always encloses the camera, so culling
+  // it can never be a win anyway.
+  starsPoints.frustumCulled = false;
   sceneGroup.add(starsPoints);
 
   // ── Horizon ring ───────────────────────────────────────────────────────────
@@ -1108,7 +1119,13 @@ function dispatchMessage(msg) {
 
 // Set once initCastReceiver() runs; used by sendState() to talk back to the phone.
 let castReceiverCtx = null;
-let connectedSenderId = null;
+// Whether at least one sender has ever connected. Deliberately NOT a specific
+// sender id: a single Cast session carries more than one sender — on-device logs
+// show both "au.com.skymap" and "com.google.android.gms" connecting for the same
+// session — so tracking one id meant SENDER_CONNECTED from the second sender
+// overwrote the first, and every later reply was addressed to a sender that
+// wasn't the app. sendState() broadcasts to all senders instead.
+let anySenderConnected = false;
 
 // Tells the connected phone what the receiver is currently doing — acknowledges
 // a SETUP, and (on SENDER_CONNECTED) reports state the phone has no other way to
@@ -1116,7 +1133,7 @@ let connectedSenderId = null;
 // Without this the phone-side UI has no signal beyond "message sent, presumably
 // received"; ProjectorSetupManager surfaces this as `receiverState`.
 function sendState(extra = {}) {
-  if (!castReceiverCtx || !connectedSenderId) return;
+  if (!castReceiverCtx || !anySenderConnected) return;
   // Pass a plain object, not a pre-stringified string — sendCustomMessage
   // serializes its `data` argument itself. Passing an already-JSON.stringify'd
   // string here made it serialize *that string*, so the Android sender's
@@ -1146,7 +1163,8 @@ function sendState(extra = {}) {
     ...extra,
   };
   try {
-    castReceiverCtx.sendCustomMessage(CONFIG.CAST_NAMESPACE, connectedSenderId, payload);
+    // undefined senderId = broadcast to every connected sender. See anySenderConnected.
+    castReceiverCtx.sendCustomMessage(CONFIG.CAST_NAMESPACE, undefined, payload);
   } catch (e) {
     console.warn('[Receiver] sendState failed:', e);
   }
@@ -1165,13 +1183,21 @@ function initCastReceiver() {
     () => setStatus('SkyMap ready', 'Open the app on your phone to set up'));
 
   ctx.addEventListener(cast.framework.system.EventType.SENDER_CONNECTED, e => {
-    connectedSenderId = e.senderId;
+    anySenderConnected = true;
     setStatus('Phone connected', 'Follow the setup steps in the app');
     sendState({ event: 'SENDER_CONNECTED' });
   });
 
   ctx.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, () => {
-    connectedSenderId = null;
+    // Only truly disconnected once no senders remain — one session's second sender
+    // (Play Services) dropping must not silence replies to the app's own sender,
+    // nor make the projector announce it's been left alone while the phone is
+    // still driving it.
+    let remaining = 0;
+    try { remaining = (ctx.getSenders() || []).length; } catch (_) {}
+    anySenderConnected = remaining > 0;
+    if (anySenderConnected) return;
+
     if (appState === AppState.RUNNING) {
       setStatus('Running autonomously ✓', '', 4000);
     } else {
