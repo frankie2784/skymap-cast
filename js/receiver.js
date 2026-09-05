@@ -1290,6 +1290,20 @@ function dispatchMessage(msg) {
       };
       break;
     }
+
+    // ── Phone explicitly hit "Stop casting" ─────────────────────────────────
+    //    initCastReceiver() sets disableIdleTimeout so the projector can keep
+    //    running autonomously after the phone merely disconnects (see
+    //    SENDER_DISCONNECTED above) — but that same flag makes this app
+    //    responsible for closing itself; the platform will not do it for us,
+    //    even when the sender ends its session with stopApplication=true.
+    //    ProjectorSetupManager.disconnect() sends this right before ending
+    //    the session, so it's the only reliable way left to actually stop.
+    case 'STOP': {
+      setStatus('Casting stopped', '', 0);
+      try { castReceiverCtx.stop(); } catch (e) { console.warn('[Receiver] stop failed:', e); }
+      break;
+    }
   }
 }
 
