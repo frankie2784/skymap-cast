@@ -766,6 +766,14 @@ function solveHomography(dirs, targets) {
 // a fixed-pixel circle and upright text directly in 2D on a canvas layered
 // over the WebGL one (see #selection-overlay in index.html and
 // resizeSelectionCanvas()/applyWarp() for how it stays aligned).
+const SELECTION_COLOR        = '#ffe270';
+const RING_RADIUS_PX         = 28;
+const RING_LINE_WIDTH_PX     = 3;
+const LABEL_GAP_PX           = 10;    // clear space between the ring's stroke and the label's cap height
+const LABEL_FONT_SIZE_PX     = 28;
+const LABEL_MIN_FONT_SIZE_PX = 12;
+const LABEL_MAX_WIDTH_PX     = 320;
+
 let selection = { visible: false, azDeg: 0, altDeg: 0, name: '' };
 
 function projectToScreen(azDeg, altDeg) {
@@ -791,26 +799,31 @@ function drawSelectionOverlay() {
 
   selectionCtx.save();
   selectionCtx.globalCompositeOperation = 'lighter';
-  selectionCtx.strokeStyle = '#ffe270';
-  selectionCtx.lineWidth = 3;
+  selectionCtx.strokeStyle = SELECTION_COLOR;
+  selectionCtx.lineWidth = RING_LINE_WIDTH_PX;
   selectionCtx.beginPath();
-  selectionCtx.arc(pt.x, pt.y, 28, 0, Math.PI * 2);
+  selectionCtx.arc(pt.x, pt.y, RING_RADIUS_PX, 0, Math.PI * 2);
   selectionCtx.stroke();
   selectionCtx.restore();
 
   if (selection.name) {
     selectionCtx.save();
-    selectionCtx.fillStyle = '#ffe270';
+    selectionCtx.fillStyle = SELECTION_COLOR;
     selectionCtx.textAlign = 'center';
-    selectionCtx.textBaseline = 'middle';
-    const maxWidth = Math.min(320, selectionCanvasEl.width - 24);
-    let fontSize = 28;
+    // Label sits *below* the ring: above it, the name covers the sky the ring
+    // is pointing into (and, for anything high up, the neighbouring stars a
+    // viewer uses to find it). 'top' baseline so the gap below the ring is the
+    // measured LABEL_GAP_PX regardless of the font size picked below.
+    selectionCtx.textBaseline = 'top';
+    const maxWidth = Math.min(LABEL_MAX_WIDTH_PX, selectionCanvasEl.width - 24);
+    let fontSize = LABEL_FONT_SIZE_PX;
     selectionCtx.font = `bold ${fontSize}px monospace`;
-    while (selectionCtx.measureText(selection.name).width > maxWidth && fontSize > 12) {
+    while (selectionCtx.measureText(selection.name).width > maxWidth && fontSize > LABEL_MIN_FONT_SIZE_PX) {
       fontSize -= 2;
       selectionCtx.font = `bold ${fontSize}px monospace`;
     }
-    selectionCtx.fillText(selection.name, pt.x, pt.y - 46);
+    const labelTop = pt.y + RING_RADIUS_PX + RING_LINE_WIDTH_PX + LABEL_GAP_PX;
+    selectionCtx.fillText(selection.name, pt.x, labelTop);
     selectionCtx.restore();
   }
 }
@@ -935,16 +948,14 @@ const SAT_RADIUS     = CONFIG.SKY_RADIUS * 0.998;
 function updateStarPositions() {
   if (sky.lat === null) return;
   const now = new Date();
-  // Hoisted once per tick — see raDecToXYZInto()'s doc comment. These are
-  // invariant across every star in the loop below, unlike ra/dec.
-  const latR = Astro.rad(sky.lat);
-  const sinLat = Math.sin(latR);
-  const cosLat = Math.cos(latR);
-  const LST = Astro.lstDeg(now, sky.lng);
+  // Hoisted once per tick — see skyContext()/raDecToXYZInto()'s doc comments.
+  // Latitude, sidereal time and the precession angles are all invariant
+  // across every star in the loop below, unlike ra/dec.
+  const ctx = Astro.skyContext(now, sky.lat, sky.lng);
   const pos = starPosAttr.array;
   for (let i = 0; i < STARS.length; i++) {
     const [, ra, dec] = STARS[i];
-    Astro.raDecToXYZInto(ra, dec, sinLat, cosLat, LST, CONFIG.SKY_RADIUS, pos, i * 3);
+    Astro.raDecToXYZInto(ra, dec, ctx, CONFIG.SKY_RADIUS, pos, i * 3);
   }
   starPosAttr.needsUpdate = true;
 }
@@ -958,7 +969,12 @@ function updatePlanetPositions() {
   for (const body of Planets.compute(now)) {
     const obj = planetSprites[body.name];
     if (!obj) continue;
-    const { alt, az } = Astro.raDecToAltAz(body.ra, body.dec, sky.lat, sky.lng, now);
+    // body.distanceEarthRadii is set on the Moon only (planets.js) — it turns
+    // the geocentric direction into the topocentric one an observer actually
+    // sees, worth up to ~1° for the Moon and nothing for anything else. Same
+    // correction the phone applies before sending a SELECT ring's altitude.
+    const { alt, az } = Astro.raDecToAltAz(
+      body.ra, body.dec, sky.lat, sky.lng, now, body.distanceEarthRadii);
     const { x, y, z } = Astro.altAzToXYZ(alt, az);
     obj.position.set(x, y, z).multiplyScalar(PLANET_RADIUS);
 

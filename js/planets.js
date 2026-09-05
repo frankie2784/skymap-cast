@@ -149,8 +149,9 @@ const Planets = (() => {
   /**
    * @returns Array<{ name, ra, dec, mag, color, sizePx, illuminatedFraction?, waxing? }>
    *          for the Sun, Moon, and the eight planets (Mercury..Neptune).
-   *          RA/Dec in degrees. illuminatedFraction/waxing are only present
-   *          on the "moon" entry.
+   *          RA/Dec in degrees, geocentric. illuminatedFraction/waxing and
+   *          distanceEarthRadii (geocentric distance, for parallax) are only
+   *          present on the "moon" entry.
    */
   function compute(date) {
     const d = daysSinceEpoch(date);
@@ -162,14 +163,19 @@ const Planets = (() => {
     const sunLonDeg = deg(Math.atan2(sunGeoEcl.y, sunGeoEcl.x));
 
     const out = [];
-    let moonRaDec = null, moonLonDeg = null;
+    let moonRaDec = null, moonLonDeg = null, moonDistanceEarthRadii = null;
     for (const name of Object.keys(ELEMENTS)) {
       let x, y, z;
       if (name === 'sun') {
         ({ x, y, z } = sunGeoEcl);
       } else if (name === 'moon') {
-        // Moon's elements are already geocentric.
-        ({ x, y, z } = orbitPosition(ELEMENTS.moon(d)));
+        // Moon's elements are already geocentric. Its `r` is in Earth radii
+        // (see ELEMENTS above) — reported so the receiver can apply diurnal
+        // parallax, which for the Moon alone is large enough to see; see
+        // astronomy.js topocentricAltDeg().
+        const moonOrbit = orbitPosition(ELEMENTS.moon(d));
+        ({ x, y, z } = moonOrbit);
+        moonDistanceEarthRadii = moonOrbit.r;
         moonLonDeg = deg(Math.atan2(y, x));
       } else {
         // Heliocentric planet position + Earth's heliocentric position
@@ -191,6 +197,7 @@ const Planets = (() => {
     );
     moon.illuminatedFraction = illuminatedFraction;
     moon.waxing = waxing;
+    moon.distanceEarthRadii = moonDistanceEarthRadii;
 
     return out;
   }

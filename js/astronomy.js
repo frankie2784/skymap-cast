@@ -112,6 +112,32 @@ const Astro = (() => {
     return Math.min(90, trueAltDeg + refractionDeg(trueAltDeg));
   }
 
+  // ─── Diurnal (topocentric) parallax ───────────────────────────────────────
+  //
+  // Ephemerides — including planets.js's — give *geocentric* directions: where
+  // a body would be seen from the centre of the Earth. An observer standing on
+  // the surface is up to one Earth radius off to the side of that, so a nearby
+  // body appears displaced toward the horizon, along its vertical circle
+  // (azimuth is unchanged). The size of the shift is Earth-radii/distance:
+  // ~9" for the Sun and planets — invisible — but up to ~1° for the Moon,
+  // which is two full Moon diameters and by far the largest single positioning
+  // error the receiver can make.
+  //
+  // That matters here because the phone's SELECT ring carries its own
+  // parallax-corrected altitude, so a geocentric Moon on the receiver lands
+  // visibly outside the ring meant to be centred on it.
+  //
+  // sin(p) = cos(h_geo) / r, with r the geocentric distance in Earth radii —
+  // the standard first-order form (Meeus ch.40), observer treated as being on
+  // a spherical Earth at sea level. Pass a falsy/absent distance for anything
+  // effectively at infinity (stars), which skips the correction entirely.
+  function topocentricAltDeg(geoAltDeg, distanceEarthRadii) {
+    if (!distanceEarthRadii || !isFinite(distanceEarthRadii)) return geoAltDeg;
+    const sinP = Math.cos(rad(geoAltDeg)) / distanceEarthRadii;
+    if (sinP >= 1) return geoAltDeg;   // nonsensical distance; leave it alone
+    return geoAltDeg - deg(Math.asin(sinP));
+  }
+
   // ─── RA / Dec → Altitude / Azimuth ────────────────────────────────────────
   //
   // Standard spherical-trig formula (Meeus ch.13).
@@ -126,7 +152,7 @@ const Astro = (() => {
   //   alt: altitude above horizon (negative = below horizon)
   //   az:  azimuth from North, clockwise (0=N, 90=E, 180=S, 270=W)
 
-  function raDecToAltAz(raDeg, decDeg, latDeg, lngDeg, date) {
+  function raDecToAltAz(raDeg, decDeg, latDeg, lngDeg, date, distanceEarthRadii) {
     const LST = lstDeg(date, lngDeg);
     const HA  = ((LST - raDeg) + 360) % 360;   // Hour Angle [0, 360)
 
@@ -154,7 +180,7 @@ const Astro = (() => {
     }
 
     return {
-      alt: apparentFromTrueDeg(deg(altR)),
+      alt: apparentFromTrueDeg(topocentricAltDeg(deg(altR), distanceEarthRadii)),
       az:  deg(azR),
     };
   }
@@ -202,6 +228,30 @@ const Astro = (() => {
     };
   }
 
+  // ─── Precession: J2000 catalogue equinox → equinox of date ───────────────
+  //
+  // stars.js stores J2000.0 positions (it is a trim of the same HYG catalogue
+  // the phone ships). Earth's axis wobbles the RA/Dec grid against the stars
+  // by ~50"/yr, which by the mid-2020s is ~0.35° — small on a phone screen,
+  // but on a calibrated projector it is several pixels, and it is exactly the
+  // kind of error that shows up as the SELECT ring sitting slightly off the
+  // star it is marking: the phone precesses its catalogue (Precession.kt) and
+  // sends an of-date az/alt, so an unprecessed receiver star lands beside it.
+  //
+  // IAU 1976 angles via Meeus' polynomials (Astronomical Algorithms 2nd ed.,
+  // eq. 21.2) — the same formula and constants as the phone's Precession.kt,
+  // good to <1" over ±2 centuries. Proper motion is not applied (a few "/yr
+  // for the fastest stars, invisible here), matching the phone.
+  const ARCSEC_TO_RAD = Math.PI / (180 * 3600);
+
+  function precessionAngles(date) {
+    const T = (julianDay(date) - 2451545.0) / 36525;
+    const zeta  = (2306.2181 * T + 0.30188 * T * T + 0.017998 * T * T * T) * ARCSEC_TO_RAD;
+    const z     = (2306.2181 * T + 1.09468 * T * T + 0.018203 * T * T * T) * ARCSEC_TO_RAD;
+    const theta = (2004.3109 * T - 0.42665 * T * T - 0.041833 * T * T * T) * ARCSEC_TO_RAD;
+    return { zeta, z, theta };
+  }
+
   // ─── Fast path: RA/Dec → world-space XYZ for a whole catalog in one tick ──
   //
   // raDecToAltAz()+altAzToXYZ() each recompute LST (Julian Day + GMST, itself
@@ -213,57 +263,87 @@ const Astro = (() => {
   // weak CPU/limited RAM this shows up as a once-a-second frame hitch from
   // both the wasted arithmetic and the GC pressure.
   //
-  // Callers hoist the invariants once per tick (see receiver.js
-  // updateStarPositions): sinLat/cosLat from the observer's latitude, and
-  // LST from lstDeg(date, lngDeg). This writes straight into the caller's
-  // Float32Array at `idx`, so a whole catalog update touches zero heap
-  // objects. Time: O(1) per star | Space: O(1) (no allocation).
-  function raDecToXYZInto(raDeg, decDeg, sinLat, cosLat, LST, radius, arr, idx) {
-    const HA  = ((LST - raDeg) + 360) % 360;
-    const haR  = rad(HA);
+  // skyContext() hoists every one of those per-tick invariants — including
+  // the precession angles' sines/cosines — into one object the caller builds
+  // once and passes to every star. raDecToXYZInto() then writes straight into
+  // the caller's Float32Array at `idx`, so a whole catalog update touches
+  // zero heap objects. Time: O(1) per star | Space: O(1) (no allocation).
+
+  function skyContext(date, latDeg, lngDeg) {
+    const latR = rad(latDeg);
+    const lstR = rad(lstDeg(date, lngDeg));
+    const { zeta, z, theta } = precessionAngles(date);
+    return {
+      sinLat: Math.sin(latR),   cosLat: Math.cos(latR),
+      sinLST: Math.sin(lstR),   cosLST: Math.cos(lstR),
+      zeta,
+      sinZ: Math.sin(z),        cosZ: Math.cos(z),
+      sinTheta: Math.sin(theta), cosTheta: Math.cos(theta),
+    };
+  }
+
+  // Everything below is done on direction vectors rather than angles: the
+  // precession rotation, the hour angle and the horizontal transform are all
+  // linear in the star's unit vector, so with the context's sines/cosines
+  // hoisted the only transcendental calls left per star are the four the
+  // catalogue's own ra/dec need, plus the asin/sin/cos round trip refraction
+  // genuinely requires (it is a function of altitude, not of a vector).
+  function raDecToXYZInto(raDeg, decDeg, ctx, radius, arr, idx) {
     const decR = rad(decDeg);
-    const sinDec = Math.sin(decR);
-    const cosDec = Math.cos(decR);
-    const cosHA  = Math.cos(haR);
+    const cosDec0 = Math.cos(decR);
+    const sinDec0 = Math.sin(decR);
 
+    // Precess J2000 → of date. Meeus eq. 21.4 rearranged as a rotation of the
+    // unit vector: (p, q, s) is the J2000 direction with RA already advanced
+    // by ζ, the θ rotation tilts it, and the final Rz(z) is the "+ z" that
+    // eq. 21.4 adds to the resulting right ascension.
+    const raZeta = rad(raDeg) + ctx.zeta;
+    const p = cosDec0 * Math.cos(raZeta);
+    const q = cosDec0 * Math.sin(raZeta);
+    const b = ctx.cosTheta * p - ctx.sinTheta * sinDec0;
+    const vx = b * ctx.cosZ - q * ctx.sinZ;
+    const vy = b * ctx.sinZ + q * ctx.cosZ;
+    const vz = ctx.sinTheta * p + ctx.cosTheta * sinDec0;   // = sin(dec of date)
+
+    // Hour angle, without ever forming it: with H = LST − RA,
+    //   cos(dec)·cos(H) = cos(LST)·vx + sin(LST)·vy
+    //   cos(dec)·sin(H) = sin(LST)·vx − cos(LST)·vy
+    const cosDecCosHA = ctx.cosLST * vx + ctx.sinLST * vy;
+    const cosDecSinHA = ctx.sinLST * vx - ctx.cosLST * vy;
+
+    // Horizontal transform (Meeus ch.13), in component form:
+    //   sin(alt)          = sin(dec)·sin(lat) + cos(dec)·cos(lat)·cos(H)
+    //   cos(alt)·cos(az)  = cos(lat)·sin(dec) − sin(lat)·cos(dec)·cos(H)   (north)
+    //   cos(alt)·sin(az)  = −cos(dec)·sin(H)                               (east)
     const sinAlt = Math.max(-1, Math.min(1,
-      sinDec * sinLat + cosDec * cosLat * cosHA));
-    // altR = asin(sinAlt), but sin(altR) is just sinAlt again — skip the
-    // asin()/sin() round trip that raDecToAltAz()+altAzToXYZ() would do.
-    const cosAlt = Math.sqrt(1 - sinAlt * sinAlt);
-
-    let azR;
-    if (cosAlt < 1e-10) {
-      azR = 0;
-    } else {
-      const cosAz = (sinDec - sinLat * sinAlt) / (cosLat * cosAlt);
-      azR = Math.acos(Math.max(-1, Math.min(1, cosAz)));
-      if (Math.sin(haR) > 0) azR = 2 * Math.PI - azR;
-    }
+      vz * ctx.sinLat + cosDecCosHA * ctx.cosLat));
+    const north = ctx.cosLat * vz - ctx.sinLat * cosDecCosHA;
+    const east  = -cosDecSinHA;
 
     // Apparent (refracted) altitude — see refractionDeg()'s doc comment above.
-    // Reintroduces the asin/sin round trip this function's fast path
-    // otherwise avoids, but only once per star per tick (1/sec), not per
-    // frame — negligible next to the ~2ms/tick this already costs.
-    const trueAltDeg = deg(Math.asin(sinAlt));
-    const appAltR = rad(apparentFromTrueDeg(trueAltDeg));
-    const sinAltApp = Math.sin(appAltR);
-    const cosAltApp = Math.cos(appAltR);
+    // Refraction only moves the star along its vertical circle, so the
+    // azimuth direction (north, east), normalised by the *true* cos(alt), is
+    // unchanged; only the altitude components are rebuilt.
+    const cosAlt = Math.sqrt(Math.max(1e-20, 1 - sinAlt * sinAlt));
+    const appAltR = rad(apparentFromTrueDeg(deg(Math.asin(sinAlt))));
+    const scale = radius * Math.cos(appAltR) / cosAlt;
 
-    arr[idx]     =  cosAltApp * Math.sin(azR) * radius;   // East
-    arr[idx + 1] =  sinAltApp * radius;                    // Up
-    arr[idx + 2] = -cosAltApp * Math.cos(azR) * radius;   // North
+    arr[idx]     = east  * scale;                    // East
+    arr[idx + 1] = Math.sin(appAltR) * radius;       // Up (zenith)
+    arr[idx + 2] = -north * scale;                   // North (−Z = North)
   }
 
   // ─── Public API ────────────────────────────────────────────────────────────
   // julianDay is exposed for planets.js, which needs it as the time base for
   // planetary orbital elements — no need to duplicate the Meeus formula there.
-  // lstDeg is exposed so callers can hoist it once per tick for
-  // raDecToXYZInto() instead of recomputing it per star.
+  // lstDeg is exposed for callers that need sidereal time directly; star
+  // catalogs should build a skyContext() once per tick and hand it to
+  // raDecToXYZInto() instead of recomputing any of it per star.
 
   return {
-    raDecToAltAz, altAzToXYZ, altAzToXY, raDecToXYZInto, julianDay, lstDeg, rad, deg,
-    refractionDeg, apparentFromTrueDeg,
+    raDecToAltAz, altAzToXYZ, altAzToXY, skyContext, raDecToXYZInto,
+    precessionAngles, julianDay, lstDeg, rad, deg,
+    refractionDeg, apparentFromTrueDeg, topocentricAltDeg,
   };
 
 })();
