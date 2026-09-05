@@ -229,17 +229,11 @@ function hideAimHighlight() {
   if (instruction) instruction.textContent = 'Drag corners on your phone to fit the projection surface';
 }
 
-// ─── Homography warp ──────────────────────────────────────────────────────────
+// ─── Projection placement ─────────────────────────────────────────────────────
 //
-// After setup we warp the Three.js canvas using a CSS matrix3d computed from
-// the user-defined quad. The canvas fills the screen at rest; the transform
-// maps its four corners to the quad corners, producing a perspective-correct
-// projection into the defined polygon. Black body background shows everywhere
-// else — ideal for a projector.
-//
-// Algorithm: solve 8×8 DLT system to find H mapping
-//   canvas corners (pixels) → quad corners (pixels)
-// then convert the 3×3 homography to a CSS matrix3d.
+// After setup the canvas is uniformly scaled into the calibrated bounds, then
+// clipped to the user-defined quad. A projective CSS warp would make the sky,
+// selected-object rings, and labels visibly stretch near the quad edges.
 
 function gaussElim(A, b) {
   const n = A.length;
@@ -302,35 +296,29 @@ function homographyToCssMatrix3d(H) {
 }
 
 function applyWarp(corners) {
-  // src is the canvas's own pre-transform layout box (offsetWidth/Height —
-  // unaffected by the CSS transform itself, unlike getBoundingClientRect()).
-  // applyAim() sizes this to match the calibrated frustum's aspect ratio, so
-  // it's no longer always the full window.
-  const srcW = canvasEl.offsetWidth;
-  const srcH = canvasEl.offsetHeight;
-  // dst — where those 4 corners should land — is expressed against the full
-  // window, since `corners` are normalised against the projector's whole
-  // output frame (that's what the phone's drag UI shows).
   const W = window.innerWidth;
   const H = window.innerHeight;
+  const points = [corners.tl, corners.tr, corners.br, corners.bl];
+  const minX = Math.min(...points.map(point => point.x));
+  const maxX = Math.max(...points.map(point => point.x));
+  const minY = Math.min(...points.map(point => point.y));
+  const maxY = Math.max(...points.map(point => point.y));
+  const scale = Math.min(maxX - minX, maxY - minY);
+  const offsetX = ((minX + maxX - scale) * W) / 2;
+  const offsetY = ((minY + maxY - scale) * H) / 2;
 
-  const src = [
-    { x: 0, y: 0 },
-    { x: srcW, y: 0 },
-    { x: srcW, y: srcH },
-    { x: 0, y: srcH },
-  ];
-  const dst = [
-    { x: corners.tl.x * W, y: corners.tl.y * H },
-    { x: corners.tr.x * W, y: corners.tr.y * H },
-    { x: corners.br.x * W, y: corners.br.y * H },
-    { x: corners.bl.x * W, y: corners.bl.y * H },
-  ];
-
-  const Hmat = computeHomography(src, dst);
+  // A projective CSS transform makes every circular marker and label locally
+  // anisotropic. Keep the rendered sky isotropic and use the quad only as a
+  // mask; uncovered parts of a non-rectangular calibration stay black.
+  const clipPoints = points.map(point => {
+    const x = ((point.x * W - offsetX) / scale / W) * 100;
+    const y = ((point.y * H - offsetY) / scale / H) * 100;
+    return `${x.toFixed(4)}% ${y.toFixed(4)}%`;
+  });
   canvasEl.style.transformOrigin = '0px 0px';
-  canvasEl.style.transform = `matrix3d(${homographyToCssMatrix3d(Hmat)})`;
-  console.log('[Warp] Homography applied');
+  canvasEl.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${scale})`;
+  canvasEl.style.clipPath = `polygon(${clipPoints.join(', ')})`;
+  console.log('[Warp] Uniform scale and clip applied');
 }
 
 // ─── Three.js scene ───────────────────────────────────────────────────────────
@@ -704,8 +692,8 @@ function applyAim(aim) {
   scene.traverse(o => { o.frustumCulled = false; });
 
   // The homography maps the aimed quad onto the full NDC square, so the render
-  // fills the whole canvas; applyWarp() then places that canvas onto the
-  // user's dragged output quad. Canvas therefore just tracks the window.
+  // fills the canvas. applyWarp() then uniformly places and clips that canvas
+  // to the user's dragged output quad. Canvas therefore tracks the window.
   renderer.setSize(window.innerWidth, window.innerHeight);
   if (appState === AppState.RUNNING) applyWarp(currentCorners);
 }
