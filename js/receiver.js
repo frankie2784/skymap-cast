@@ -9,16 +9,29 @@
  *
  * Messages accepted:
  *   QUAD_CORNERS  { corners: {tl,tr,br,bl} }   live corner updates while dragging
- *   SETUP         { lat, lng, azimuthOffset,
+ *   SETUP         { lat, lng, aim: {bl,br,tl: {az,alt}},
  *                   corners: {tl,tr,br,bl} }    finalise setup, start sky
+ *
+ * Two independent calibrations compose to produce the final image:
+ *   1. `aim` — three real-world (azimuth, altitude) directions, measured by
+ *      physically pointing the phone at the bottom-left, bottom-right, and
+ *      top-left corners of the light hitting the wall/ceiling from the
+ *      viewer's actual seat. Drives a true off-axis perspective camera (see
+ *      applyAim()) so the rendered image is what that flat surface would
+ *      really look like as a window onto the sky, not a fisheye dome.
+ *   2. `corners` — normalised 0–1 screen-space quad, unchanged from before.
+ *      Applied afterwards as a CSS homographic warp, purely to correct the
+ *      *projector's own* keystone (mounted off-angle) or to confine the sky
+ *      to only part of the projector's full output frame. Orthogonal to (1):
+ *      this never affects which sky direction maps to which pixel, only
+ *      where that already-correct rectangular image physically lands.
  *
  * Corner coordinates are normalised 0–1 (x: left=0, right=1; y: top=0, bot=1).
  *
  * After SETUP the receiver:
- *   1. Applies a CSS homographic warp to the Three.js canvas so the sky fills
- *      the user-defined polygon exactly.
+ *   1. Builds the off-axis camera from `aim`, then applies the `corners` warp.
  *   2. Downloads TLEs from CelesTrak and runs SGP4 every 5s.
- *   3. Recomputes star positions every 60s.
+ *   3. Recomputes star positions every 1s.
  *   4. Refreshes TLEs every 2h.
  *   The phone may disconnect; the sky continues indefinitely.
  */
@@ -40,7 +53,10 @@ const CONFIG = {
   // continuous motion instead.
   STAR_UPDATE_MS:     1_000,
   MIN_SAT_ALT_DEG:   -5,
-  DOME_R:             900,
+  // Radius (arbitrary world units) of the sphere every sky object is placed
+  // on. Absolute scale doesn't matter — the off-axis frustum math (applyAim)
+  // is scale-invariant — it just needs to be comfortably inside [near, far].
+  SKY_RADIUS:         900,
   CAST_NAMESPACE:     'urn:x-cast:com.skymap.receiver',
 };
 
@@ -52,7 +68,10 @@ let appState = AppState.WAITING;
 const sky = {
   lat:            null,
   lng:            null,
-  azimuthOffset:  0,
+  // Real-world (azimuth, altitude) directions to 3 corners of the physical
+  // surface, measured from the viewer's seat — see applyAim(). Null until
+  // the first SETUP arrives.
+  aim:            null,
   tleRecords:     [],
   // Which layers are drawn — toggled from the phone (see LAYERS message) with
   // the same three groupings the phone app's own HUD toggles use.
@@ -88,13 +107,19 @@ function isValidCoord(v) {
   return typeof v === 'number' && isFinite(v);
 }
 
+function isValidAim(aim) {
+  return !!aim && ['bl', 'br', 'tl'].every(
+    k => aim[k] && isValidCoord(aim[k].az) && isValidCoord(aim[k].alt),
+  );
+}
+
 function saveSetup() {
   // Nothing meaningful to resume yet — e.g. a LAYERS toggle arrived before the
   // first SETUP. Don't overwrite (or create) a persisted entry with it.
-  if (!isValidCoord(sky.lat) || !isValidCoord(sky.lng)) return;
+  if (!isValidCoord(sky.lat) || !isValidCoord(sky.lng) || !isValidAim(sky.aim)) return;
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      lat: sky.lat, lng: sky.lng, azimuthOffset: sky.azimuthOffset,
+      lat: sky.lat, lng: sky.lng, aim: sky.aim,
       corners: currentCorners, layers: sky.layers,
     }));
   } catch (e) {
@@ -108,7 +133,7 @@ function loadSetup() {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    if (!isValidCoord(parsed.lat) || !isValidCoord(parsed.lng)) return null;
+    if (!isValidCoord(parsed.lat) || !isValidCoord(parsed.lng) || !isValidAim(parsed.aim)) return null;
     // Merge over the defaults so a setup saved before layer toggles existed
     // (no `layers` key) still restores with everything on.
     parsed.layers = { ...sky.layers, ...(parsed.layers || {}) };
@@ -246,14 +271,23 @@ function homographyToCssMatrix3d(H) {
 }
 
 function applyWarp(corners) {
+  // src is the canvas's own pre-transform layout box (offsetWidth/Height —
+  // unaffected by the CSS transform itself, unlike getBoundingClientRect()).
+  // applyAim() sizes this to match the calibrated frustum's aspect ratio, so
+  // it's no longer always the full window.
+  const srcW = canvasEl.offsetWidth;
+  const srcH = canvasEl.offsetHeight;
+  // dst — where those 4 corners should land — is expressed against the full
+  // window, since `corners` are normalised against the projector's whole
+  // output frame (that's what the phone's drag UI shows).
   const W = window.innerWidth;
   const H = window.innerHeight;
 
   const src = [
     { x: 0, y: 0 },
-    { x: W, y: 0 },
-    { x: W, y: H },
-    { x: 0, y: H },
+    { x: srcW, y: 0 },
+    { x: srcW, y: srcH },
+    { x: 0, y: srcH },
   ];
   const dst = [
     { x: corners.tl.x * W, y: corners.tl.y * H },
@@ -279,9 +313,11 @@ let planetGroup;               // toggled via sky.layers.planets
 let planetSprites = {};        // body name -> THREE.Sprite, built once in initScene()
 let STARS = [];   // deduped catalog, populated by initScene(); read by updateStarPositions()
 
-// Stars sit on the z=0 plane in fisheye-projected (x,y) — see Astro.altAzToXY.
-// Distance from the origin *is* zenith angle here (0 at zenith, DOME_R at the
-// horizon), so alpha fades using that radius instead of world-space altitude.
+// Stars sit on a sphere of radius SKY_RADIUS (see Astro.altAzToXYZ) — every
+// star is the same distance from the origin regardless of altitude, so unlike
+// the old flat fisheye disc, distance-from-origin can no longer signal "near
+// the horizon". Use the world-space Y (up) component instead: Y/SKY_RADIUS is
+// exactly sin(altitude), zero at the horizon and 1 at the zenith.
 const STAR_VERT = `
   attribute float starSize;
   attribute vec3  starColor;
@@ -291,8 +327,8 @@ const STAR_VERT = `
   varying   float vAlpha;
   void main() {
     vColor = starColor;
-    float r = length(position.xy) / ${CONFIG.DOME_R}.0;
-    float horizonFade = 1.0 - smoothstep(0.94, 1.02, r);
+    float sinAlt = position.y / ${CONFIG.SKY_RADIUS}.0;
+    float horizonFade = smoothstep(-0.031, 0.094, sinAlt);
 
     // Subtle, per-star-desynced flicker — atmospheric scintillation, not a
     // strobe. +-15% around full brightness so it reads as "alive" without
@@ -389,23 +425,22 @@ function initScene() {
 
   // ── Camera ───────────────────────────────────────────────────────────────
   //
-  // Sky content is pre-projected to flat (x,y) via Astro.altAzToXY (equidistant
-  // azimuthal / fisheye: zenith at centre, horizon at the DOME_R-radius edge) —
-  // see that function's doc for why. An orthographic camera looking straight
-  // down -Z at that plane then renders it undistorted, same as a real fisheye
-  // lens photo: a circle of sky inscribed in the frame, black in the corners.
-  // A perspective camera can't do this — no FOV shows a full 180° hemisphere
-  // without the edges stretching to infinity.
-  camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
-  camera.position.set(0, 0, 5);
+  // A real perspective camera, positioned at the viewer's eye (the origin —
+  // sky objects are placed relative to the observer, not the projector) and
+  // oriented/framed by applyAim() once real-world corner measurements arrive:
+  // a true off-axis (asymmetric) frustum, so the render is exactly what
+  // someone standing in that spot would see looking through a window shaped
+  // like the physical wall/ceiling patch — see applyAim()'s doc for the math.
+  // Until the first SETUP lands, use an ordinary symmetric perspective camera
+  // pointed at the zenith as a reasonable preview.
+  camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 1, CONFIG.SKY_RADIUS * 4);
+  camera.position.set(0, 0, 0);
   camera.up.set(0, 1, 0);
-  camera.lookAt(0, 0, 0);
-  updateCameraFrustum();
+  camera.lookAt(0, CONFIG.SKY_RADIUS, 0);
 
   // No separate "ground" mesh is needed: nothing is ever placed at radius >
-  // DOME_R, so that area renders as plain black (the clear colour) — exactly
-  // what the vignette outside a real fisheye lens's circular image looks like.
-  // The horizon ring below marks the DOME_R boundary itself.
+  // SKY_RADIUS, so that area renders as plain black (the clear colour).
+  // The horizon ring below marks the SKY_RADIUS boundary itself.
 
   // ── Stars ──────────────────────────────────────────────────────────────────
   // Dedup the catalog by sky position — some alternate-name aliases share
@@ -444,26 +479,31 @@ function initScene() {
   sceneGroup.add(starsPoints);
 
   // ── Horizon ring ───────────────────────────────────────────────────────────
-  // RingGeometry already lies flat in the XY plane by default — exactly the
-  // plane everything else is projected onto, so no rotation is needed (unlike
-  // the old 3-D hemisphere model, where this had to be laid down as a "floor").
-  // Left in `scene` rather than `sceneGroup`: a circle centred on the origin
-  // is rotationally symmetric, so it doesn't need to follow the azimuth spin.
-  const ring = new THREE.Mesh(
-    new THREE.RingGeometry(CONFIG.DOME_R * 0.99, CONFIG.DOME_R, 128),
-    new THREE.MeshBasicMaterial({ color: 0x223344, transparent: true, opacity: 0.4, side: THREE.DoubleSide }),
+  // A literal circle of points around the horizon (alt=0, every azimuth) on
+  // the SKY_RADIUS sphere — replaces the old flat RingGeometry annulus, which
+  // only made sense lying in the fisheye's projection plane. Only the portion
+  // inside the calibrated frustum ever actually renders on screen.
+  const ringPts = [];
+  for (let az = 0; az <= 360; az += 2) {
+    const { x, y, z } = Astro.altAzToXYZ(0, az);
+    ringPts.push(new THREE.Vector3(x, y, z).multiplyScalar(CONFIG.SKY_RADIUS));
+  }
+  const ring = new THREE.LineLoop(
+    new THREE.BufferGeometry().setFromPoints(ringPts),
+    new THREE.LineBasicMaterial({ color: 0x223344, transparent: true, opacity: 0.4 }),
   );
   scene.add(ring);
 
   // ── Compass markers ────────────────────────────────────────────────────────
-  // Sit exactly on the horizon ring (alt=0) at their compass bearing — part of
-  // sceneGroup so they spin with the sky when azimuthOffset rotates it.
+  // Sit exactly on the horizon (alt=0) at their compass bearing, slightly
+  // inside SKY_RADIUS (like planets/satellites — see updatePlanetPositions())
+  // so they draw in front of the star field rather than z-fighting with it.
   const compassGroup = new THREE.Group();
   [{ t:'N', az:0 }, { t:'E', az:90 }, { t:'S', az:180 }, { t:'W', az:270 }]
     .forEach(({ t, az }) => {
       const sprite = _textSprite(t, az === 0 ? '#4a9eff' : '#336677');
-      const { x, y } = Astro.altAzToXY(0, az);
-      sprite.position.set(x * CONFIG.DOME_R, y * CONFIG.DOME_R, 0.5);
+      const { x, y, z } = Astro.altAzToXYZ(0, az);
+      sprite.position.set(x, y, z).multiplyScalar(CONFIG.SKY_RADIUS * 0.999);
       sprite.scale.set(40, 20, 1);
       compassGroup.add(sprite);
     });
@@ -499,7 +539,9 @@ function initScene() {
       obj.scale.set(body.sizePx, body.sizePx, 1);
       if (body.name === 'saturn') obj.add(_buildSaturnRing());
     }
-    obj.position.z = 0.4;   // in front of stars, behind compass/satellite markers
+    // Position is fully overwritten every tick by updatePlanetPositions() —
+    // see PLANET_RADIUS there for how depth-ordering vs. the star field works
+    // now that everything sits on a sphere instead of a flat plane.
     planetSprites[body.name] = obj;
     planetGroup.add(obj);
   }
@@ -507,24 +549,99 @@ function initScene() {
   applyLayerVisibility();
 
   window.addEventListener('resize', () => {
-    updateCameraFrustum();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    if (appState === AppState.RUNNING) applyWarp(currentCorners);
+    if (sky.aim) {
+      applyAim(sky.aim);   // re-fits canvas sizing + re-applies the corners warp
+    } else {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
   });
 }
 
-// Fills the entire viewport with the fisheye disc ("cover" sizing) regardless
-// of aspect ratio, rather than showing the whole circle letterboxed in black
-// on the longer axis. This crops the disc's edges (near-horizon sky) on
-// whichever axis is shorter — the projector's rectangle is fully covered by
-// sky instead of showing a circular "dome" with black bars/corners.
-function updateCameraFrustum() {
-  const aspect = window.innerWidth / window.innerHeight;
-  const halfW  = aspect >= 1 ? CONFIG.DOME_R : CONFIG.DOME_R * aspect;
-  const halfH  = aspect >= 1 ? CONFIG.DOME_R / aspect : CONFIG.DOME_R;
-  camera.left = -halfW; camera.right = halfW;
-  camera.top  = halfH;  camera.bottom = -halfH;
-  camera.updateProjectionMatrix();
+// ─── Off-axis perspective camera (real corner calibration) ────────────────────
+//
+// Implements Kooima's Generalized Perspective Projection ("Generalized
+// Perspective Projection", R. Kooima, 2009 — the standard technique behind
+// CAVE/multi-wall VR displays): given the eye position and 3 corners of a
+// *planar* screen, build the exact off-axis (asymmetric) frustum that makes
+// that screen show the correct, undistorted view from that eye position.
+//
+// We only have angular measurements (azimuth/altitude from the phone's
+// compass), not real distances, so pa/pb/pc below are placed at the same
+// arbitrary radius (SKY_RADIUS) along each measured direction rather than at
+// their true physical positions. This is an approximation — the true corners
+// of a flat wall/ceiling patch aren't all equidistant from the viewer unless
+// the viewer faces it dead-on — but the frustum math is scale-invariant, and
+// for a typical fairly-flat-on viewing angle the resulting angular error is
+// well within what phone compass/tilt sensors are accurate to anyway. Using
+// only 3 corners (bl, br, tl) is deliberate: that's all Kooima's algorithm
+// needs, and the 4th (tr) is implied by the other three forming a rectangle —
+// asking the user to also measure it would add a step without adding
+// information (a 4th independent measurement would just make the "screen" a
+// non-planar approximation error instead of a clean rectangle).
+function applyAim(aim) {
+  const pe = new THREE.Vector3(0, 0, 0);
+  const toVec3 = ({ az, alt }) => {
+    const { x, y, z } = Astro.altAzToXYZ(alt, az);
+    return new THREE.Vector3(x, y, z).multiplyScalar(CONFIG.SKY_RADIUS);
+  };
+  const pa = toVec3(aim.bl);   // bottom-left
+  const pb = toVec3(aim.br);   // bottom-right
+  const pc = toVec3(aim.tl);   // top-left
+
+  const vr = new THREE.Vector3().subVectors(pb, pa).normalize();   // screen right
+  const vu = new THREE.Vector3().subVectors(pc, pa).normalize();   // screen up
+  const vn = new THREE.Vector3().crossVectors(vr, vu).normalize(); // screen normal
+
+  // vn must point from the screen back toward the eye for the formulas below —
+  // flip it (and vu, to keep the basis right-handed) if the measured corners
+  // came out wound the other way.
+  if (vn.dot(pe.clone().sub(pa)) < 0) {
+    vn.negate();
+    vu.negate();
+  }
+
+  const near = 1;
+  const far  = CONFIG.SKY_RADIUS * 4;
+  const va = pa.clone().sub(pe);
+  const vb = pb.clone().sub(pe);
+  const vc = pc.clone().sub(pe);
+  const d  = -va.dot(vn);          // eye-to-screen distance along the normal
+  const nOverD = near / d;
+  const l = vr.dot(va) * nOverD;
+  const r = vr.dot(vb) * nOverD;
+  const b = vu.dot(va) * nOverD;
+  const t = vu.dot(vc) * nOverD;
+
+  camera.projectionMatrix.makePerspective(l, r, t, b, near, far);
+  camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+
+  // Orient the camera so its local axes match the screen basis: local +X/+Y
+  // are the screen's right/up (matching vr/vu, which l/r/b/t above are
+  // expressed in), and Three's camera looks down local -Z, so local +Z must
+  // be vn (pointing back toward the eye, i.e. away from the screen).
+  // matrixAutoUpdate=false stops Three recomputing `matrix` from
+  // position/quaternion/scale (which we never set) — matrixWorld and
+  // matrixWorldInverse still get derived from `matrix` normally on the next
+  // render, same as any other camera.
+  camera.matrixAutoUpdate = false;
+  camera.matrix.makeBasis(vr, vu, vn);
+  camera.matrix.setPosition(pe);
+
+  // Resize the canvas (both its CSS box and WebGL drawing buffer) to exactly
+  // match the frustum's aspect ratio, so nothing gets stretched before the
+  // `corners` homography warp is applied on top of it. See applyWarp(), which
+  // reads the canvas's own current box size rather than assuming full-window.
+  const frustumAspect = (r - l) / (t - b);
+  let w, h;
+  if (window.innerWidth / window.innerHeight >= frustumAspect) {
+    h = window.innerHeight; w = h * frustumAspect;
+  } else {
+    w = window.innerWidth; h = w / frustumAspect;
+  }
+  renderer.setSize(w, h);
+  if (appState === AppState.RUNNING) applyWarp(currentCorners);
 }
 
 function _textSprite(text, color) {
@@ -633,6 +750,17 @@ function applyLayerVisibility() {
 
 // ─── Star / satellite / planet updates ─────────────────────────────────────
 
+// Everything sits on a sphere of radius SKY_RADIUS around the viewer (see
+// Astro.altAzToXYZ), but planets/satellites use a very slightly smaller
+// radius than the stars — same trick as the old flat model's small +z
+// offsets, just expressed as radius instead: since none of these materials
+// write to the depth buffer (see their depthWrite:false), what actually
+// determines paint order is Three's back-to-front distance sort for
+// transparent objects, so "slightly closer to the eye" is what makes
+// planets draw over stars, and satellites over both.
+const PLANET_RADIUS = CONFIG.SKY_RADIUS * 0.999;
+const SAT_RADIUS     = CONFIG.SKY_RADIUS * 0.998;
+
 function updateStarPositions() {
   if (sky.lat === null) return;
   const now = new Date();
@@ -640,8 +768,8 @@ function updateStarPositions() {
   for (let i = 0; i < STARS.length; i++) {
     const [, ra, dec] = STARS[i];
     const { alt, az } = Astro.raDecToAltAz(ra, dec, sky.lat, sky.lng, now);
-    const { x, y } = Astro.altAzToXY(alt, az);
-    pos[i*3]=x*CONFIG.DOME_R; pos[i*3+1]=y*CONFIG.DOME_R; pos[i*3+2]=0;
+    const { x, y, z } = Astro.altAzToXYZ(alt, az);
+    pos[i*3]=x*CONFIG.SKY_RADIUS; pos[i*3+1]=y*CONFIG.SKY_RADIUS; pos[i*3+2]=z*CONFIG.SKY_RADIUS;
   }
   starPosAttr.needsUpdate = true;
 }
@@ -656,16 +784,26 @@ function updatePlanetPositions() {
     const obj = planetSprites[body.name];
     if (!obj) continue;
     const { alt, az } = Astro.raDecToAltAz(body.ra, body.dec, sky.lat, sky.lng, now);
-    const { x, y } = Astro.altAzToXY(alt, az);
-    obj.position.x = x * CONFIG.DOME_R;
-    obj.position.y = y * CONFIG.DOME_R;
+    const { x, y, z } = Astro.altAzToXYZ(alt, az);
+    obj.position.set(x, y, z).multiplyScalar(PLANET_RADIUS);
 
-    // Moon is a Mesh with a phase shader (see MOON_FRAG) — its uniforms need
-    // refreshing too, not just its position. Phase changes slowly (~12h per
-    // 1% of a cycle) so this only needs to keep pace with the position update.
-    if (body.name === 'moon' && obj.material?.uniforms) {
-      obj.material.uniforms.uK.value = body.illuminatedFraction;
-      obj.material.uniforms.uSide.value = body.waxing ? 1 : -1;
+    // Sprites (Sun, and every other body) billboard to face the camera
+    // automatically as part of how Three.js renders them — that's baked into
+    // the old orthographic-camera design too, so it kept working unchanged.
+    // The Moon is the one Mesh (needed for its phase shader, which a Sprite's
+    // fixed quad-facing-camera trick can't drive), so unlike a Sprite it does
+    // NOT auto-face the eye — with the eye fixed at the origin, lookAt(0,0,0)
+    // re-orients it to face inward every tick as it moves across the sphere.
+    if (body.name === 'moon') {
+      obj.lookAt(0, 0, 0);
+      // Moon is a Mesh with a phase shader (see MOON_FRAG) — its uniforms
+      // need refreshing too, not just its position/orientation. Phase changes
+      // slowly (~12h per 1% of a cycle) so this only needs to keep pace with
+      // the position update.
+      if (obj.material?.uniforms) {
+        obj.material.uniforms.uK.value = body.illuminatedFraction;
+        obj.material.uniforms.uSide.value = body.waxing ? 1 : -1;
+      }
     }
   }
 }
@@ -762,7 +900,6 @@ function _updateSatSprites(sats) {
       map: texture, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
     }));
     sprite.scale.set(16, 16, 1);
-    sprite.position.z = 0.5;   // sit just in front of the star plane, avoid z-fighting
     _satSpritePool.push(sprite);
     satGroup.add(sprite);
   }
@@ -770,26 +907,15 @@ function _updateSatSprites(sats) {
   for (let i = 0; i < _satSpritePool.length; i++) {
     const sprite = _satSpritePool[i];
     if (i < sats.length) {
-      // altAzToXY already encodes zenith angle as radius (see its doc) — an object
-      // just below the horizon (alt down to MIN_SAT_ALT_DEG) lands just outside the
-      // DOME_R disc, which is the correct, undistorted continuation of the projection.
-      const { x, y } = Astro.altAzToXY(sats[i].alt, sats[i].az);
-      sprite.position.x = x * CONFIG.DOME_R;
-      sprite.position.y = y * CONFIG.DOME_R;
+      // SAT_RADIUS < PLANET_RADIUS < SKY_RADIUS — see its declaration — puts
+      // satellites in front of both planets and stars.
+      const { x, y, z } = Astro.altAzToXYZ(sats[i].alt, sats[i].az);
+      sprite.position.set(x, y, z).multiplyScalar(SAT_RADIUS);
       sprite.visible = true;
     } else {
       sprite.visible = false;
     }
   }
-}
-
-function applyAzimuthOffset() {
-  // Rotate the flat sky field around the viewing axis (Z, since the camera now
-  // looks down -Z) so the direction the user pointed at the ▲ marker ends up at
-  // the top of the image. See Astro.altAzToXY: az=0 (North) is already "up"
-  // (+Y) with no offset, and az increases clockwise, matching Three's Z-axis
-  // rotation sense from the camera's point of view.
-  sceneGroup.rotation.z = THREE.MathUtils.degToRad(sky.azimuthOffset);
 }
 
 // ─── Render loop ──────────────────────────────────────────────────────────────
@@ -813,20 +939,21 @@ function animate() {
 // (see loadSetup()) — both need to lock the corners, spin up the sky, and start
 // the TLE download the same way.
 function applySetup(setup) {
-  sky.lat           = setup.lat;
-  sky.lng           = setup.lng;
-  sky.azimuthOffset = setup.azimuthOffset ?? 0;
+  sky.lat = setup.lat;
+  sky.lng = setup.lng;
+  sky.aim = setup.aim ?? sky.aim;
   if (setup.corners) currentCorners = setup.corners;
   if (setup.layers)  sky.layers = { ...sky.layers, ...setup.layers };
 
   appState = AppState.RUNNING;
   hideCalibrationOverlay();
 
-  applyAzimuthOffset();
   applyLayerVisibility();
   updateStarPositions();
   updatePlanetPositions();
-  applyWarp(currentCorners);
+  // applyAim() also resizes the canvas to match the calibrated frustum and
+  // re-applies the `corners` warp on top — no separate applyWarp() call needed.
+  if (sky.aim) applyAim(sky.aim); else applyWarp(currentCorners);
   fetchTLEs();
 }
 
@@ -876,7 +1003,7 @@ function handleMessage(_, raw) {
 
       setStatus(
         `📍 ${msg.lat.toFixed(3)}°, ${msg.lng.toFixed(3)}°`,
-        `North offset ${sky.azimuthOffset.toFixed(1)}°`,
+        'Calibrated',
         5000,
       );
       sendState({ event: 'SETUP_APPLIED' });
@@ -921,7 +1048,7 @@ function sendState(extra = {}) {
     appState,
     lat: sky.lat,
     lng: sky.lng,
-    azimuthOffset: sky.azimuthOffset,
+    aim: sky.aim,
     layers: sky.layers,
     ...extra,
   };
@@ -986,6 +1113,6 @@ window.addEventListener('DOMContentLoaded', () => {
     setStatus('Preview mode', 'Paste test command in browser console');
     console.info('[Receiver] Test commands:');
     console.info("  handleMessage('dev', JSON.stringify({ type:'QUAD_CORNERS', corners:{tl:{x:0.1,y:0.1},tr:{x:0.9,y:0.15},br:{x:0.85,y:0.85},bl:{x:0.12,y:0.88}} }))");
-    console.info("  handleMessage('dev', JSON.stringify({ type:'SETUP', lat:-37.8, lng:144.96, azimuthOffset:45, corners:{tl:{x:0.1,y:0.1},tr:{x:0.9,y:0.15},br:{x:0.85,y:0.85},bl:{x:0.12,y:0.88}} }))");
+    console.info("  handleMessage('dev', JSON.stringify({ type:'SETUP', lat:-37.8, lng:144.96, aim:{bl:{az:170,alt:20},br:{az:190,alt:20},tl:{az:170,alt:50}}, corners:{tl:{x:0.1,y:0.1},tr:{x:0.9,y:0.15},br:{x:0.85,y:0.85},bl:{x:0.12,y:0.88}} }))");
   }
 });
