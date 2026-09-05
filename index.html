@@ -59,6 +59,31 @@
       margin-top: 0.25rem;
       transition: opacity 1.5s ease;
     }
+
+    /* ── Calibration overlay pulse animations ──
+       Previously SMIL <animate> on each circle's `r` — a geometry property, which
+       combined with vector-effect="non-scaling-stroke" forced the renderer to
+       recompute and repaint that geometry every tick (no compositor fast path).
+       On Chromecast's weak/software-fallback GPU, five of these running at once
+       (four corner dots + marker + aim-ring, different durations beating against
+       each other) showed up as a periodic full-screen blank-then-block repaint.
+       transform/opacity are compositor-only — same visual pulse, no repaint. */
+    #calibration-svg circle[class^="pulse-"] {
+      transform-box: fill-box;
+      transform-origin: center;
+    }
+    @keyframes pulse-dot    { 0%, 100% { transform: scale(0.888); } 50% { transform: scale(1.222); } }
+    @keyframes pulse-marker { 0%, 100% { transform: scale(0.909); opacity: 1; } 50% { transform: scale(1.273); opacity: 0.4; } }
+    @keyframes pulse-aim    { 0%, 100% { transform: scale(0.76); } 50% { transform: scale(1.24); } }
+    .pulse-dot    { animation: pulse-dot 2s ease-in-out infinite; }
+    #dot-tr       { animation-delay: 0.5s; }
+    #dot-br       { animation-delay: 1s; }
+    #dot-bl       { animation-delay: 1.5s; }
+    .pulse-marker { animation: pulse-marker 1.5s ease-in-out infinite; }
+    .pulse-aim    { animation: pulse-aim 1.2s ease-in-out infinite; }
+    @media (prefers-reduced-motion: reduce) {
+      .pulse-dot, .pulse-marker, .pulse-aim { animation: none; }
+    }
   </style>
 </head>
 <body>
@@ -102,26 +127,18 @@
       vector-effect="non-scaling-stroke"/>
 
     <!-- Corner draggable markers (phone controls these) -->
-    <circle id="dot-tl" cx="0.15" cy="0.20" r="0.018"
+    <circle id="dot-tl" class="pulse-dot" cx="0.15" cy="0.20" r="0.018"
       fill="rgba(74,158,255,0.25)" stroke="#4a9eff" stroke-width="0.003"
-      vector-effect="non-scaling-stroke">
-      <animate attributeName="r" values="0.016;0.022;0.016" dur="2s" repeatCount="indefinite"/>
-    </circle>
-    <circle id="dot-tr" cx="0.85" cy="0.20" r="0.018"
+      vector-effect="non-scaling-stroke"/>
+    <circle id="dot-tr" class="pulse-dot" cx="0.85" cy="0.20" r="0.018"
       fill="rgba(74,158,255,0.25)" stroke="#4a9eff" stroke-width="0.003"
-      vector-effect="non-scaling-stroke">
-      <animate attributeName="r" values="0.016;0.022;0.016" dur="2s" begin="0.5s" repeatCount="indefinite"/>
-    </circle>
-    <circle id="dot-br" cx="0.85" cy="0.80" r="0.018"
+      vector-effect="non-scaling-stroke"/>
+    <circle id="dot-br" class="pulse-dot" cx="0.85" cy="0.80" r="0.018"
       fill="rgba(74,158,255,0.25)" stroke="#4a9eff" stroke-width="0.003"
-      vector-effect="non-scaling-stroke">
-      <animate attributeName="r" values="0.016;0.022;0.016" dur="2s" begin="1s" repeatCount="indefinite"/>
-    </circle>
-    <circle id="dot-bl" cx="0.15" cy="0.80" r="0.018"
+      vector-effect="non-scaling-stroke"/>
+    <circle id="dot-bl" class="pulse-dot" cx="0.15" cy="0.80" r="0.018"
       fill="rgba(74,158,255,0.25)" stroke="#4a9eff" stroke-width="0.003"
-      vector-effect="non-scaling-stroke">
-      <animate attributeName="r" values="0.016;0.022;0.016" dur="2s" begin="1.5s" repeatCount="indefinite"/>
-    </circle>
+      vector-effect="non-scaling-stroke"/>
 
     <!--
       Top-centre orientation marker (▲).
@@ -131,12 +148,9 @@
     -->
     <g id="cal-marker" transform="translate(0.5, 0.17)">
       <!-- Outer glow ring -->
-      <circle cx="0" cy="0" r="0.022" fill="rgba(74,158,255,0.15)"
+      <circle class="pulse-marker" cx="0" cy="0" r="0.022" fill="rgba(74,158,255,0.15)"
         stroke="rgba(74,158,255,0.5)" stroke-width="0.002"
-        vector-effect="non-scaling-stroke">
-        <animate attributeName="r" values="0.020;0.028;0.020" dur="1.5s" repeatCount="indefinite"/>
-        <animate attributeName="opacity" values="1;0.4;1" dur="1.5s" repeatCount="indefinite"/>
-      </circle>
+        vector-effect="non-scaling-stroke"/>
       <!-- Triangle -->
       <polygon points="0,-0.014 0.010,0.007 -0.010,0.007"
         fill="#4a9eff" opacity="0.95"/>
@@ -149,11 +163,9 @@
       where the projected rectangle's corners actually are.
     -->
     <g id="aim-highlight" style="display:none">
-      <circle id="aim-ring" cx="0.5" cy="0.5" r="0.05"
+      <circle id="aim-ring" class="pulse-aim" cx="0.5" cy="0.5" r="0.05"
         fill="rgba(255,200,60,0.18)" stroke="#ffc83c" stroke-width="4"
-        vector-effect="non-scaling-stroke">
-        <animate attributeName="r" values="0.038;0.062;0.038" dur="1.2s" repeatCount="indefinite"/>
-      </circle>
+        vector-effect="non-scaling-stroke"/>
       <circle id="aim-dot" cx="0.5" cy="0.5" r="0.008" fill="#ffc83c"/>
     </g>
 

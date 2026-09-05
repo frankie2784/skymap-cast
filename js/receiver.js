@@ -70,6 +70,12 @@ const CONFIG = {
 const AppState = { WAITING: 'waiting', CALIBRATING: 'calibrating', RUNNING: 'running' };
 let appState = AppState.WAITING;
 
+// Snapshot of the last confirmed SETUP (see applySetup()), so a cancelled
+// recalibration (CANCEL_CALIBRATION message) has something to revert to
+// instead of leaving the receiver stuck showing the calibration overlay —
+// null until the very first SETUP ever lands.
+let lastAppliedSetup = null;
+
 const sky = {
   lat:            null,
   lng:            null,
@@ -1128,6 +1134,41 @@ function applySetup(setup) {
   // re-applies the `corners` warp on top — no separate applyWarp() call needed.
   if (sky.aim) applyAim(sky.aim); else applyWarp(currentCorners);
   fetchTLEs();
+
+  // Snapshot the now-confirmed state — see cancelCalibration()'s use of this.
+  lastAppliedSetup = {
+    lat: sky.lat, lng: sky.lng, aim: sky.aim,
+    corners: currentCorners, layers: { ...sky.layers },
+  };
+}
+
+// Reverts an in-progress recalibration (QUAD_CORNERS/AIM_TARGET already
+// switched appState to CALIBRATING — see dispatchMessage()) back to the last
+// confirmed SETUP, without re-fetching TLEs or otherwise disturbing anything
+// already running (satellites keep propagating on their own timer regardless
+// of appState). If no SETUP has ever been confirmed (cancelling out of a
+// first-time setup), there's nothing to revert to — go back to idle WAITING
+// instead of leaving the calibration overlay stuck on screen.
+function cancelCalibration() {
+  hideAimHighlight();
+  if (lastAppliedSetup) {
+    sky.lat = lastAppliedSetup.lat;
+    sky.lng = lastAppliedSetup.lng;
+    sky.aim = lastAppliedSetup.aim;
+    currentCorners = lastAppliedSetup.corners;
+    sky.layers = { ...lastAppliedSetup.layers };
+
+    appState = AppState.RUNNING;
+    hideCalibrationOverlay();
+    applyLayerVisibility();
+    if (sky.aim) applyAim(sky.aim); else applyWarp(currentCorners);
+    setStatus('Recalibration cancelled', 'Resumed previous setup', 4000);
+  } else {
+    appState = AppState.WAITING;
+    hideCalibrationOverlay();
+    setStatus('Waiting for setup…', 'Open SkyMap on your phone');
+  }
+  sendState({ event: 'CALIBRATION_CANCELLED' });
 }
 
 // ─── Message handler ──────────────────────────────────────────────────────────
@@ -1203,6 +1244,16 @@ function dispatchMessage(msg) {
       applyLayerVisibility();
       saveSetup();
       sendState({ event: 'LAYERS_APPLIED' });
+      break;
+    }
+
+    // ── User backed out of the setup sheet without finishing ────────────────
+    //    Only QUAD_CORNERS/AIM_TARGET can start a recalibration, and previously
+    //    nothing could end one except a full SETUP — so leaving the setup sheet
+    //    (swipe-dismiss, back button) left the projector stuck on the
+    //    calibration overlay indefinitely. See cancelCalibration().
+    case 'CANCEL_CALIBRATION': {
+      cancelCalibration();
       break;
     }
 
