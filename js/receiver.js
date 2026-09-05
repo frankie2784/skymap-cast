@@ -628,6 +628,17 @@ function applyAim(aim) {
   camera.matrixAutoUpdate = false;
   camera.matrix.makeBasis(vr, vu, vn);
   camera.matrix.setPosition(pe);
+  // Object3D.updateMatrixWorld() (called every frame by the renderer) only
+  // copies `matrix` into `matrixWorld` when matrixWorldNeedsUpdate is true —
+  // normally set as a side effect of the auto-update path this camera has
+  // opted out of. Without this line the renderer keeps using whatever
+  // matrixWorld the camera had *before* matrixAutoUpdate was turned off (the
+  // placeholder zenith-facing camera from initScene()), while still using the
+  // new, correct off-axis projectionMatrix — the mismatch between a stale
+  // view direction and a frustum built for a completely different one meant
+  // nothing ever fell inside the view, i.e. a black screen regardless of
+  // layer visibility.
+  camera.matrixWorldNeedsUpdate = true;
 
   // Resize the canvas (both its CSS box and WebGL drawing buffer) to exactly
   // match the frustum's aspect ratio, so nothing gets stretched before the
