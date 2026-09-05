@@ -47,12 +47,16 @@ const CONFIG = {
   CELESTRAK_STATIONS: 'https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=json',
   TLE_REFRESH_MS:     2 * 60 * 60 * 1000,
   SAT_PROPAGATE_MS:   5_000,
-  // Was 60s, causing a visible once-a-minute "jump" as the whole sky snapped to
-  // its new position. Benchmarked at ~2ms/tick for the full 8,870-star catalog
-  // on a dev machine (worth re-checking on real Chromecast hardware, but even
-  // 5x slower is a trivial duty cycle at 1Hz); 1s gives smooth-looking
-  // continuous motion instead.
-  STAR_UPDATE_MS:     1_000,
+  // Stars only drift ~0.25 deg/minute (Earth's sidereal rotation), so unlike
+  // satellites they don't need a fast cadence to look smooth — they need a
+  // cadence fine enough that each step's jump isn't a visible discrete snap.
+  // 60s (~0.25 deg/step, all ~8,870 stars moving in lockstep in a single
+  // frame) was visibly jumpy; 15s (~0.06 deg/step) keeps the same total drift
+  // but spread over 4x as many steps, at 1/15th the CPU/GC cost of the 1s
+  // cadence this used to run at. Must stay >= SAT_PROPAGATE_MS, since
+  // satellites move fast enough (low orbit, ~90min/orbit) that they need the
+  // more frequent cadence, not the other way round.
+  STAR_UPDATE_MS:     15_000,
   MIN_SAT_ALT_DEG:   -5,
   // Radius (arbitrary world units) of the sphere every sky object is placed
   // on. Absolute scale doesn't matter — applyAim()'s homography is linear, so
@@ -925,12 +929,16 @@ const SAT_RADIUS     = CONFIG.SKY_RADIUS * 0.998;
 function updateStarPositions() {
   if (sky.lat === null) return;
   const now = new Date();
+  // Hoisted once per tick — see raDecToXYZInto()'s doc comment. These are
+  // invariant across every star in the loop below, unlike ra/dec.
+  const latR = Astro.rad(sky.lat);
+  const sinLat = Math.sin(latR);
+  const cosLat = Math.cos(latR);
+  const LST = Astro.lstDeg(now, sky.lng);
   const pos = starPosAttr.array;
   for (let i = 0; i < STARS.length; i++) {
     const [, ra, dec] = STARS[i];
-    const { alt, az } = Astro.raDecToAltAz(ra, dec, sky.lat, sky.lng, now);
-    const { x, y, z } = Astro.altAzToXYZ(alt, az);
-    pos[i*3]=x*CONFIG.SKY_RADIUS; pos[i*3+1]=y*CONFIG.SKY_RADIUS; pos[i*3+2]=z*CONFIG.SKY_RADIUS;
+    Astro.raDecToXYZInto(ra, dec, sinLat, cosLat, LST, CONFIG.SKY_RADIUS, pos, i * 3);
   }
   starPosAttr.needsUpdate = true;
 }

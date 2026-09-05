@@ -175,10 +175,56 @@ const Astro = (() => {
     };
   }
 
+  // ─── Fast path: RA/Dec → world-space XYZ for a whole catalog in one tick ──
+  //
+  // raDecToAltAz()+altAzToXYZ() each recompute LST (Julian Day + GMST, itself
+  // several Date field reads and float ops) and sin(lat)/cos(lat) from
+  // scratch — invariant across every star in a single tick's loop, so calling
+  // them per-star (as updateStarPositions() used to) redoes that work ~8,870x
+  // a second for no reason, and allocates a fresh {alt,az} and {x,y,z} object
+  // per star (~17,700 allocations/sec) purely as scratch. On a Chromecast's
+  // weak CPU/limited RAM this shows up as a once-a-second frame hitch from
+  // both the wasted arithmetic and the GC pressure.
+  //
+  // Callers hoist the invariants once per tick (see receiver.js
+  // updateStarPositions): sinLat/cosLat from the observer's latitude, and
+  // LST from lstDeg(date, lngDeg). This writes straight into the caller's
+  // Float32Array at `idx`, so a whole catalog update touches zero heap
+  // objects. Time: O(1) per star | Space: O(1) (no allocation).
+  function raDecToXYZInto(raDeg, decDeg, sinLat, cosLat, LST, radius, arr, idx) {
+    const HA  = ((LST - raDeg) + 360) % 360;
+    const haR  = rad(HA);
+    const decR = rad(decDeg);
+    const sinDec = Math.sin(decR);
+    const cosDec = Math.cos(decR);
+    const cosHA  = Math.cos(haR);
+
+    const sinAlt = Math.max(-1, Math.min(1,
+      sinDec * sinLat + cosDec * cosLat * cosHA));
+    // altR = asin(sinAlt), but sin(altR) is just sinAlt again — skip the
+    // asin()/sin() round trip that raDecToAltAz()+altAzToXYZ() would do.
+    const cosAlt = Math.sqrt(1 - sinAlt * sinAlt);
+
+    let azR;
+    if (cosAlt < 1e-10) {
+      azR = 0;
+    } else {
+      const cosAz = (sinDec - sinLat * sinAlt) / (cosLat * cosAlt);
+      azR = Math.acos(Math.max(-1, Math.min(1, cosAz)));
+      if (Math.sin(haR) > 0) azR = 2 * Math.PI - azR;
+    }
+
+    arr[idx]     =  cosAlt * Math.sin(azR) * radius;   // East
+    arr[idx + 1] =  sinAlt * radius;                    // Up
+    arr[idx + 2] = -cosAlt * Math.cos(azR) * radius;   // North
+  }
+
   // ─── Public API ────────────────────────────────────────────────────────────
   // julianDay is exposed for planets.js, which needs it as the time base for
   // planetary orbital elements — no need to duplicate the Meeus formula there.
+  // lstDeg is exposed so callers can hoist it once per tick for
+  // raDecToXYZInto() instead of recomputing it per star.
 
-  return { raDecToAltAz, altAzToXYZ, altAzToXY, julianDay, rad, deg };
+  return { raDecToAltAz, altAzToXYZ, altAzToXY, raDecToXYZInto, julianDay, lstDeg, rad, deg };
 
 })();
