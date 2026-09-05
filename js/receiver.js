@@ -831,9 +831,23 @@ function applySetup(setup) {
 // ─── Message handler ──────────────────────────────────────────────────────────
 
 function handleMessage(_, raw) {
+  // CAF's addCustomMessageListener has been observed delivering `raw` as an
+  // already-parsed object in some SDK versions (mirroring how sendCustomMessage
+  // auto-serializes objects on the way out — see sendState()), rather than the
+  // plain string the Android sender actually put on the wire via
+  // CastSession.sendMessage(). JSON.parse() on a non-string coerces via
+  // String(raw) -> "[object Object]" -> throws, so every message from the phone
+  // was being silently dropped. Accept both shapes.
   let msg;
-  try { msg = JSON.parse(raw); }
-  catch { console.warn('[Receiver] Bad JSON'); return; }
+  if (typeof raw === 'string') {
+    try { msg = JSON.parse(raw); }
+    catch { console.warn('[Receiver] Bad JSON'); return; }
+  } else if (raw && typeof raw === 'object') {
+    msg = raw;
+  } else {
+    console.warn('[Receiver] Bad message payload:', raw);
+    return;
+  }
 
   switch (msg.type) {
 
@@ -890,7 +904,14 @@ let connectedSenderId = null;
 // received"; ProjectorSetupManager surfaces this as `receiverState`.
 function sendState(extra = {}) {
   if (!castReceiverCtx || !connectedSenderId) return;
-  const payload = JSON.stringify({
+  // Pass a plain object, not a pre-stringified string — sendCustomMessage
+  // serializes its `data` argument itself. Passing an already-JSON.stringify'd
+  // string here made it serialize *that string*, so the Android sender's
+  // JSONObject(message) received a JSON text wrapped in an extra layer of
+  // quotes (JSONTokener parsed a String primitive, not an object) and threw
+  // "Value {...} of type java.lang.String cannot be converted to JSONObject"
+  // on every STATE message — confirmed via on-device logcat.
+  const payload = {
     type: 'STATE',
     appState,
     lat: sky.lat,
@@ -898,7 +919,7 @@ function sendState(extra = {}) {
     azimuthOffset: sky.azimuthOffset,
     layers: sky.layers,
     ...extra,
-  });
+  };
   try {
     castReceiverCtx.sendCustomMessage(CONFIG.CAST_NAMESPACE, connectedSenderId, payload);
   } catch (e) {
