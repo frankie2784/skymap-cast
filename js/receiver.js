@@ -9,16 +9,17 @@
  *
  * Messages accepted:
  *   QUAD_CORNERS  { corners: {tl,tr,br,bl} }   live corner updates while dragging
- *   SETUP         { lat, lng, aim: {bl,br,tl: {az,alt}},
+ *   SETUP         { lat, lng, aim: {bl,br,tl,tr: {az,alt}},
  *                   corners: {tl,tr,br,bl} }    finalise setup, start sky
  *
  * Two independent calibrations compose to produce the final image:
- *   1. `aim` — three real-world (azimuth, altitude) directions, measured by
- *      physically pointing the phone at the bottom-left, bottom-right, and
- *      top-left corners of the light hitting the wall/ceiling from the
- *      viewer's actual seat. Drives a true off-axis perspective camera (see
- *      applyAim()) so the rendered image is what that flat surface would
- *      really look like as a window onto the sky, not a fisheye dome.
+ *   1. `aim` — four real-world (azimuth, altitude) directions, measured by
+ *      physically pointing the phone at each corner of the light hitting the
+ *      wall/ceiling from the viewer's actual seat. Determines the exact
+ *      direction -> image homography (see applyAim()), so the rendered image
+ *      is what that flat surface would really look like as a window onto the
+ *      sky, not a fisheye dome. All four are needed: three corners cannot
+ *      determine the shape, since angles alone carry no distance.
  *   2. `corners` — normalised 0–1 screen-space quad, unchanged from before.
  *      Applied afterwards as a CSS homographic warp, purely to correct the
  *      *projector's own* keystone (mounted off-angle) or to confine the sky
@@ -29,7 +30,7 @@
  * Corner coordinates are normalised 0–1 (x: left=0, right=1; y: top=0, bot=1).
  *
  * After SETUP the receiver:
- *   1. Builds the off-axis camera from `aim`, then applies the `corners` warp.
+ *   1. Builds the camera homography from `aim`, then applies the `corners` warp.
  *   2. Downloads TLEs from CelesTrak and runs SGP4 every 5s.
  *   3. Recomputes star positions every 1s.
  *   4. Refreshes TLEs every 2h.
@@ -54,8 +55,8 @@ const CONFIG = {
   STAR_UPDATE_MS:     1_000,
   MIN_SAT_ALT_DEG:   -5,
   // Radius (arbitrary world units) of the sphere every sky object is placed
-  // on. Absolute scale doesn't matter — the off-axis frustum math (applyAim)
-  // is scale-invariant — it just needs to be comfortably inside [near, far].
+  // on. Absolute scale doesn't matter — applyAim()'s homography is linear, so
+  // the radius cancels when the clip coordinates are dehomogenised.
   SKY_RADIUS:         900,
   CAST_NAMESPACE:     'urn:x-cast:com.skymap.receiver',
 };
@@ -68,7 +69,7 @@ let appState = AppState.WAITING;
 const sky = {
   lat:            null,
   lng:            null,
-  // Real-world (azimuth, altitude) directions to 3 corners of the physical
+  // Real-world (azimuth, altitude) directions to all 4 corners of the physical
   // surface, measured from the viewer's seat — see applyAim(). Null until
   // the first SETUP arrives.
   aim:            null,
@@ -108,7 +109,7 @@ function isValidCoord(v) {
 }
 
 function isValidAim(aim) {
-  return !!aim && ['bl', 'br', 'tl'].every(
+  return !!aim && ['bl', 'br', 'tl', 'tr'].every(
     k => aim[k] && isValidCoord(aim[k].az) && isValidCoord(aim[k].alt),
   );
 }
@@ -620,113 +621,112 @@ function initScene() {
   });
 }
 
-// ─── Off-axis perspective camera (real corner calibration) ────────────────────
+// ─── Perspective camera from a 4-corner homography ───────────────────────────
 //
-// Implements Kooima's Generalized Perspective Projection ("Generalized
-// Perspective Projection", R. Kooima, 2009 — the standard technique behind
-// CAVE/multi-wall VR displays): given the eye position and 3 corners of a
-// *planar* screen, build the exact off-axis (asymmetric) frustum that makes
-// that screen show the correct, undistorted view from that eye position.
+// Maps sky DIRECTIONS to image coordinates using the exact projective map
+// determined by the four measured corner directions. For any planar surface
+// viewed from a point, direction -> image is exactly a homography (a 3x3
+// projective map), so four corner correspondences determine it completely —
+// with no knowledge of distances and no assumption that the surface is a
+// rectangle, only that it's flat.
 //
-// We only have angular measurements (azimuth/altitude from the phone's
-// compass), not real distances, so pa/pb/pc below are placed at the same
-// arbitrary radius (SKY_RADIUS) along each measured direction rather than at
-// their true physical positions. This is an approximation — the true corners
-// of a flat wall/ceiling patch aren't all equidistant from the viewer unless
-// the viewer faces it dead-on — but the frustum math is scale-invariant, and
-// for a typical fairly-flat-on viewing angle the resulting angular error is
-// well within what phone compass/tilt sensors are accurate to anyway. Using
-// only 3 corners (bl, br, tl) is deliberate: that's all Kooima's algorithm
-// needs, and the 4th (tr) is implied by the other three forming a rectangle —
-// asking the user to also measure it would add a step without adding
-// information (a 4th independent measurement would just make the "screen" a
-// non-planar approximation error instead of a clean rectangle).
+// WHY NOT KOOIMA'S OFF-AXIS FRUSTUM (what this used to do)?
+// That algorithm needs the screen's real 3D corner POINTS, and takes
+// (br-bl) ⊥ (tl-bl) as given. All we can measure with a compass is
+// DIRECTIONS — angles carry no distance — so the old code placed all three
+// corners at the same radius. But a real rectangle viewed off-axis has its
+// corners at genuinely different distances, so equal-radius placement warps
+// it into a non-rectangular patch: measured on real calibration data the
+// basis came out 110° instead of 90°, and the resulting frustum pointed
+// 10-13° away from the corners the user actually aimed at. Verified against
+// a synthetic perfect rectangle with perfect sensors, the approximation alone
+// introduced ~6° of skew — it was never a sensor-accuracy problem.
+//
+// The 4th corner is what makes this exact: 4 correspondences x 2 coordinates
+// = the 8 degrees of freedom of a homography. Three corners genuinely cannot
+// determine the shape, which is why the old approach had to invent the
+// missing constraint and got it wrong.
 function applyAim(aim) {
-  const pe = new THREE.Vector3(0, 0, 0);
-  const toVec3 = ({ az, alt }) => {
-    const { x, y, z } = Astro.altAzToXYZ(alt, az);
-    return new THREE.Vector3(x, y, z).multiplyScalar(CONFIG.SKY_RADIUS);
-  };
-  const pa = toVec3(aim.bl);   // bottom-left
-  const pb = toVec3(aim.br);   // bottom-right
-  const pc = toVec3(aim.tl);   // top-left
+  const dirs = ['bl', 'br', 'tl', 'tr'].map(k => {
+    const { x, y, z } = Astro.altAzToXYZ(aim[k].alt, aim[k].az);
+    return [x, y, z];
+  });
+  // Image-space targets, in NDC: the rendered frame's own corners.
+  const targets = [[-1, -1], [1, -1], [-1, 1], [1, 1]];
 
-  const vr = new THREE.Vector3().subVectors(pb, pa).normalize();   // screen right
-  const vu = new THREE.Vector3().subVectors(pc, pa).normalize();   // screen up
-  const vn = new THREE.Vector3().crossVectors(vr, vu).normalize(); // screen normal
-
-  // Degenerate input guard. If the three measured directions are collinear (or two
-  // land on the same spot) the cross product is the zero vector, normalize() yields
-  // NaN, and every downstream value — the whole projection matrix — becomes NaN.
-  // Three renders that as an entirely black frame with no error of any kind, which
-  // is indistinguishable from "the sky just isn't drawing". Bail out loudly instead,
-  // keeping whatever camera we had, and report it so the phone can surface it.
-  const degenerate = ![vr, vu, vn].every(v => isFinite(v.x) && isFinite(v.y) && isFinite(v.z));
-  if (degenerate) {
-    console.warn('[Receiver] Degenerate aim calibration — corners are collinear:', aim);
+  const H = solveHomography(dirs, targets);
+  if (!H) {
+    console.warn('[Receiver] Degenerate aim calibration — cannot solve homography:', aim);
     sendState({ event: 'AIM_DEGENERATE', error: 'corners collinear or coincident' });
     return;
   }
 
-  // vn must point from the screen back toward the eye for the formulas below —
-  // flip it (and vu, to keep the basis right-handed) if the measured corners
-  // came out wound the other way.
-  if (vn.dot(pe.clone().sub(pa)) < 0) {
-    vn.negate();
-    vu.negate();
-  }
-
-  const near = 1;
-  const far  = CONFIG.SKY_RADIUS * 4;
-  const va = pa.clone().sub(pe);
-  const vb = pb.clone().sub(pe);
-  const vc = pc.clone().sub(pe);
-  const d  = -va.dot(vn);          // eye-to-screen distance along the normal
-  const nOverD = near / d;
-  const l = vr.dot(va) * nOverD;
-  const r = vr.dot(vb) * nOverD;
-  const b = vu.dot(va) * nOverD;
-  const t = vu.dot(vc) * nOverD;
-
-  camera.projectionMatrix.makePerspective(l, r, t, b, near, far);
-  camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
-
-  // Orient the camera so its local axes match the screen basis: local +X/+Y
-  // are the screen's right/up (matching vr/vu, which l/r/b/t above are
-  // expressed in), and Three's camera looks down local -Z, so local +Z must
-  // be vn (pointing back toward the eye, i.e. away from the screen).
-  // matrixAutoUpdate=false stops Three recomputing `matrix` from
-  // position/quaternion/scale (which we never set) — matrixWorld and
-  // matrixWorldInverse still get derived from `matrix` normally on the next
-  // render, same as any other camera.
+  // Build the 4x4 the renderer wants. Objects live at world position p = R*d,
+  // and H is linear, so H*(R*d) dehomogenises to exactly H*d — the radius
+  // cancels and every object lands where its direction says it should.
+  //   clip.x = H0·p,  clip.y = H1·p,  clip.w = H2·p
+  // clip.z is left at 0 (so NDC z = 0, mid-range and always inside the depth
+  // clip): nothing here writes depth — every material is transparent with
+  // depthWrite:false and relies on draw order — so there's no depth precision
+  // to preserve. Points behind the surface plane get clip.w < 0 and are
+  // clipped by the GPU, which is the behaviour we want.
   camera.matrixAutoUpdate = false;
-  camera.matrix.makeBasis(vr, vu, vn);
-  camera.matrix.setPosition(pe);
-  // Object3D.updateMatrixWorld() (called every frame by the renderer) only
-  // copies `matrix` into `matrixWorld` when matrixWorldNeedsUpdate is true —
-  // normally set as a side effect of the auto-update path this camera has
-  // opted out of. Without this line the renderer keeps using whatever
-  // matrixWorld the camera had *before* matrixAutoUpdate was turned off (the
-  // placeholder zenith-facing camera from initScene()), while still using the
-  // new, correct off-axis projectionMatrix — the mismatch between a stale
-  // view direction and a frustum built for a completely different one meant
-  // nothing ever fell inside the view, i.e. a black screen regardless of
-  // layer visibility.
+  camera.matrix.identity();          // H maps world directions directly; no view transform
   camera.matrixWorldNeedsUpdate = true;
+  camera.projectionMatrix.set(
+    H[0][0], H[0][1], H[0][2], 0,
+    H[1][0], H[1][1], H[1][2], 0,
+    0,       0,       0,       0,
+    H[2][0], H[2][1], H[2][2], 0,
+  );
 
-  // Resize the canvas (both its CSS box and WebGL drawing buffer) to exactly
-  // match the frustum's aspect ratio, so nothing gets stretched before the
-  // `corners` homography warp is applied on top of it. See applyWarp(), which
-  // reads the canvas's own current box size rather than assuming full-window.
-  const frustumAspect = (r - l) / (t - b);
-  let w, h;
-  if (window.innerWidth / window.innerHeight >= frustumAspect) {
-    h = window.innerHeight; w = h * frustumAspect;
-  } else {
-    w = window.innerWidth; h = w / frustumAspect;
-  }
-  renderer.setSize(w, h);
+  // Three derives its culling frustum from the projection matrix, which this
+  // deliberately non-standard one breaks. Nothing here is expensive enough to
+  // need culling (one Points cloud, ~10 sprites, a line loop), so switch it
+  // off wholesale rather than have objects vanish for the wrong reasons — the
+  // star field already had to do this, see initScene().
+  scene.traverse(o => { o.frustumCulled = false; });
+
+  // The homography maps the aimed quad onto the full NDC square, so the render
+  // fills the whole canvas; applyWarp() then places that canvas onto the
+  // user's dragged output quad. Canvas therefore just tracks the window.
+  renderer.setSize(window.innerWidth, window.innerHeight);
   if (appState === AppState.RUNNING) applyWarp(currentCorners);
+}
+
+// Solves the 3x3 H with H[2][2] fixed to 1 (8 unknowns) such that, for each
+// correspondence, dehomogenise(H · dir) == target. Straight Gaussian
+// elimination with partial pivoting on the 8x8 system; returns null if the
+// system is singular, which means the measured directions are degenerate
+// (collinear, or two captures landing on the same spot).
+function solveHomography(dirs, targets) {
+  const N = 8;
+  const M = [];
+  for (let i = 0; i < 4; i++) {
+    const [dx, dy, dz] = dirs[i];
+    const [u, v] = targets[i];
+    M.push([dx, dy, dz, 0, 0, 0, -u * dx, -u * dy, u * dz]);
+    M.push([0, 0, 0, dx, dy, dz, -v * dx, -v * dy, v * dz]);
+  }
+  for (let c = 0; c < N; c++) {
+    let piv = c;
+    for (let r = c + 1; r < N; r++) if (Math.abs(M[r][c]) > Math.abs(M[piv][c])) piv = r;
+    if (Math.abs(M[piv][c]) < 1e-12) return null;
+    [M[c], M[piv]] = [M[piv], M[c]];
+    for (let r = 0; r < N; r++) {
+      if (r === c) continue;
+      const f = M[r][c] / M[c][c];
+      if (!f) continue;
+      for (let k = c; k <= N; k++) M[r][k] -= f * M[c][k];
+    }
+  }
+  const h = [];
+  for (let i = 0; i < N; i++) {
+    const v = M[i][N] / M[i][i];
+    if (!isFinite(v)) return null;
+    h.push(v);
+  }
+  return [[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], 1]];
 }
 
 // Selection label — a dedicated (wider, shrink-to-fit) canvas rather than
@@ -1325,6 +1325,6 @@ window.addEventListener('DOMContentLoaded', () => {
     setStatus('Preview mode', 'Paste test command in browser console');
     console.info('[Receiver] Test commands:');
     console.info("  handleMessage('dev', JSON.stringify({ type:'QUAD_CORNERS', corners:{tl:{x:0.1,y:0.1},tr:{x:0.9,y:0.15},br:{x:0.85,y:0.85},bl:{x:0.12,y:0.88}} }))");
-    console.info("  handleMessage('dev', JSON.stringify({ type:'SETUP', lat:-37.8, lng:144.96, aim:{bl:{az:170,alt:20},br:{az:190,alt:20},tl:{az:170,alt:50}}, corners:{tl:{x:0.1,y:0.1},tr:{x:0.9,y:0.15},br:{x:0.85,y:0.85},bl:{x:0.12,y:0.88}} }))");
+    console.info("  handleMessage('dev', JSON.stringify({ type:'SETUP', lat:-37.8, lng:144.96, aim:{bl:{az:170,alt:20},br:{az:190,alt:20},tl:{az:170,alt:50},tr:{az:190,alt:50}}, corners:{tl:{x:0.1,y:0.1},tr:{x:0.9,y:0.15},br:{x:0.85,y:0.85},bl:{x:0.12,y:0.88}} }))");
   }
 });
