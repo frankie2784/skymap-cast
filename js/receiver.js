@@ -730,10 +730,13 @@ const PLANET_FRAG = `
 
   const float PI = 3.14159265359;
   // Saturn's ring, in units of the globe's radius, and how far it's squashed
-  // vertically for a "tilted" look — the same 0.55-0.9 (of a half-extent 0.5
-  // quad) and 0.45 the old separate RingGeometry mesh used.
-  const float RING_INNER  = 1.1;
-  const float RING_OUTER  = 1.8;
+  // vertically for a "tilted" look. Matches the phone app's real ring
+  // geometry exactly (PlanetSphereRenderer.kt's RING_INNER_R/RING_OUTER_R:
+  // 1.15/2.3, padded slightly from the true C-ring-inner/A-ring-outer
+  // fractions of ~1.11/~2.27) rather than the tighter 1.1/1.8 this used to
+  // use, which fell noticeably short of the real ring's outer edge.
+  const float RING_INNER  = 1.15;
+  const float RING_OUTER  = 2.3;
   const float RING_SQUASH = 0.45;
 
   void main() {
@@ -1384,7 +1387,7 @@ const PLANET_TEXTURES = {
 // back to having a world-space extent, and would come out sheared and
 // detached from the globe it's supposed to be wrapped around. No glow — the
 // user found it unnecessary once the disc itself was rendering correctly.
-const SATURN_QUAD_SCALE = 2.0;   // room for RING_OUTER (1.8 globe radii) plus margin
+const SATURN_QUAD_SCALE = 2.5;   // matches the phone's RING_QUAD_R — room for RING_OUTER (2.3) plus margin
 // Per the user: planets 2x larger on top of the previous doubling (4x their
 // original planets.js SIZE_PX) — same kind of display-size knob as
 // SUN_SIZE_MULTIPLIER, not a change to how large they should really look.

@@ -76,9 +76,22 @@ const Planets = (() => {
 
   // Fixed display size in px — a simple stand-in for true brightness/angular-size
   // scaling (which would need distance + phase, more than this receiver tracks).
+  //
+  // The 7 planets' relative sizes are ranked to match the phone app's own
+  // stylized ranking (PlanetSphereRenderer.kt's SIZE_MULTIPLIER: sun/moon 1.3,
+  // jupiter 1.5, saturn 1.35, uranus 1.05, neptune 1.0, venus 0.95, mars 0.8,
+  // mercury 0.7 — Jupiter/Saturn biggest, Mercury smallest) scaled to roughly
+  // this table's previous magnitude. Sun/Moon are NOT re-ranked against that
+  // same table: on the phone, SIZE_MULTIPLIER is only a pixel-floor that a
+  // planet falls back to once its real angular size shrinks below it — for
+  // the Sun/Moon, real angular size (½° in the sky) almost never drops that
+  // low, so their "1.3" floor ranking is essentially inert and isn't what
+  // actually determines how big they look; using it here would make them far
+  // too small relative to the planets. Sun/Moon keep their existing sizes
+  // (further scaled by SUN_SIZE_MULTIPLIER in receiver.js).
   const SIZE_PX = {
-    sun: 50, moon: 40, mercury: 8, venus: 14, mars: 10,
-    jupiter: 12, saturn: 10, uranus: 6, neptune: 6,
+    sun: 50, moon: 40, mercury: 5, venus: 7, mars: 6,
+    jupiter: 11, saturn: 10, uranus: 8, neptune: 7,
   };
 
   // Position of a body relative to the point its own elements orbit — the Sun
