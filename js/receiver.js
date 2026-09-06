@@ -515,6 +515,51 @@ const MOON_FRAG = `
   }
 `;
 
+// Sphere-impostor shaders for Mercury/Venus/Mars/Jupiter/Saturn/Uranus/Neptune
+// — see _buildPlanetBillboard's doc comment for why a billboard+shader is
+// used instead of an actual 3D mesh sphere (an actual mesh sphere squishes
+// into an ellipse under perspective/fisheye projection when off-axis).
+const PLANET_VERT = `
+  varying vec2 vUv;
+  void main() {
+    vUv = uv;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`;
+const PLANET_FRAG = `
+  uniform sampler2D uMap;
+  varying vec2 vUv;
+  void main() {
+    vec2 p = vUv * 2.0 - 1.0;
+    float r2 = dot(p, p);
+    if (r2 > 1.0) discard;
+
+    // Reconstruct a unit-sphere normal from disc-local (x,y) — same core
+    // trick as the phone's PLANET_SPHERE_FRAGMENT (SkyShaders.kt) — so the
+    // flat equirectangular texture reads as a properly curved globe rather
+    // than a stretched rectangle.
+    vec3 normal = vec3(p.x, p.y, sqrt(max(1.0 - r2, 0.0)));
+
+    // Fixed sub-observer point straight down +z: the phone drives this from
+    // real per-body pole RA/Dec and sub-Earth longitude ephemeris, which this
+    // receiver doesn't have. A fixed face is a reasonable simplification at
+    // the ~6-14px this renders at — nowhere near large enough to notice the
+    // planet isn't rotating.
+    float lon = atan(p.x, normal.z);
+    float lat = asin(p.y);
+    vec2 uv = vec2(0.5 + lon / (2.0 * 3.14159265359), 0.5 - lat / 3.14159265359);
+
+    // Simple frontal Lambertian shading (light from the viewer) for a touch
+    // of limb darkening — not the real phase/terminator, just enough to read
+    // as a lit sphere rather than a flat decal.
+    float lighting = 0.35 + 0.65 * normal.z;
+
+    vec3 color = texture2D(uMap, uv).rgb * lighting;
+    float edgeAlpha = 1.0 - smoothstep(0.94, 1.0, sqrt(r2));
+    gl_FragColor = vec4(color, edgeAlpha);
+  }
+`;
+
 // Set while the WebGL context is lost (see the listeners below) — animate()
 // checks this so it doesn't keep calling renderer.render() against a dead
 // context every frame, which is a guaranteed console-spamming no-op at best.
@@ -670,11 +715,12 @@ function initScene() {
   // child so it rides along automatically without separate position tracking.
   //
   // Mercury/Venus/Mars/Jupiter/Saturn/Uranus/Neptune each get their own
-  // equirectangular surface texture mapped onto a small sphere (see
-  // PLANET_TEXTURES/_buildPlanetSphere below) — a sphere wraps the texture
-  // correctly at any size, unlike a flat sprite quad which would squash it.
-  // The Sun (50px) and Moon (40px, with real phase shape) keep their existing
-  // bespoke builders.
+  // equirectangular surface texture mapped via a sphere-impostor billboard
+  // (see PLANET_TEXTURES/_buildPlanetBillboard below) — same technique the
+  // phone app uses, and for the same reason: it always renders as a circle,
+  // unlike an actual mesh sphere which squishes into an ellipse off-axis
+  // under this app's fisheye/perspective projection. The Sun (50px) and Moon
+  // (40px, with real phase shape) keep their existing bespoke builders.
   planetGroup = new THREE.Group();
   for (const body of Planets.compute(skyNow())) {
     let obj;
@@ -683,7 +729,7 @@ function initScene() {
     } else if (body.name === 'moon') {
       obj = _buildMoonMesh(body);
     } else if (PLANET_TEXTURES[body.name]) {
-      obj = _buildPlanetSphere(body, PLANET_TEXTURES[body.name]);
+      obj = _buildPlanetBillboard(body, PLANET_TEXTURES[body.name]);
     } else {
       obj = new THREE.Sprite(new THREE.SpriteMaterial({
         map: _dotTexture(body.color), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
@@ -1033,10 +1079,11 @@ function _buildMoonMesh(body) {
 }
 
 function _buildSaturnRing() {
-  // Parented to the Saturn sphere (see _buildPlanetSphere), which inherits its
-  // scale.set(sizePx, sizePx, sizePx) — the sphere geometry has radius 0.5 in
-  // the same units, so these raw radii are chosen to land just outside that
-  // after inheriting the same scale: ~0.55x-0.9x sizePx.
+  // Parented to Saturn's billboard disc (see _buildPlanetBillboard), which
+  // inherits its scale.set(sizePx, sizePx, 1) — a PlaneGeometry(1,1) spans
+  // -0.5..+0.5 of that scale (radius ~0.5 "dot units"), so these raw radii
+  // are chosen to land just outside that after inheriting the same scale:
+  // ~0.55x-0.9x sizePx.
   const geo = new THREE.RingGeometry(0.55, 0.9, 48);
   const mat = new THREE.MeshBasicMaterial({
     map: _loadTexture('saturn_ring.webp'), transparent: true, side: THREE.DoubleSide,
@@ -1071,13 +1118,21 @@ const PLANET_TEXTURES = {
   neptune: 'neptune.webp',
 };
 
-// A sphere (not a flat sprite) so the equirectangular texture wraps correctly
-// at any viewing angle instead of reading as a squished rectangle. Radius 0.5
-// matches the "dot units" _buildSaturnRing()'s ring geometry is sized against.
-function _buildPlanetSphere(body, textureFile) {
+// Sphere IMPOSTOR, not an actual 3D mesh sphere: a camera-facing billboard
+// quad whose fragment shader reconstructs a unit-sphere normal per pixel and
+// samples the equirectangular texture through it (see PLANET_FRAG). This is
+// the same technique the phone app uses (SkyShaders.kt's PLANET_SPHERE_VERTEX
+// / PLANET_SPHERE_FRAGMENT) and for the same reason: an actual mesh sphere is
+// subject to real perspective/fisheye distortion and projects as an ellipse
+// when off-axis, while a billboard re-oriented to face the eye every tick
+// (see the lookAt() call in updatePlanetPositions(), same trick already used
+// for the Moon) always renders as a perfect circle regardless of camera
+// angle. Unlike the phone, this receiver has no per-body pole/sub-Earth
+// ephemeris to drive real orientation — see PLANET_FRAG's fixed-face note.
+function _buildPlanetBillboard(body, textureFile) {
   const group = new THREE.Group();
 
-  // Faint additive glow behind the sphere, same treatment as the Sun's halo —
+  // Faint additive glow behind the disc, same treatment as the Sun's halo —
   // keeps the planet easy to spot before the eye resolves the tiny disc.
   const halo = new THREE.Sprite(new THREE.SpriteMaterial({
     map: _dotTexture(body.color), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
@@ -1086,12 +1141,16 @@ function _buildPlanetSphere(body, textureFile) {
   halo.position.z = -0.05;
   group.add(halo);
 
-  const geo = new THREE.SphereGeometry(0.5, 24, 16);
-  const mat = new THREE.MeshBasicMaterial({ map: _loadTexture(textureFile), transparent: true, depthWrite: false });
-  const sphere = new THREE.Mesh(geo, mat);
-  sphere.scale.set(body.sizePx, body.sizePx, body.sizePx);
-  if (body.name === 'saturn') sphere.add(_buildSaturnRing());
-  group.add(sphere);
+  const geo = new THREE.PlaneGeometry(1, 1);
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uMap: { value: _loadTexture(textureFile) } },
+    vertexShader: PLANET_VERT, fragmentShader: PLANET_FRAG,
+    transparent: true, depthWrite: false,
+  });
+  const disc = new THREE.Mesh(geo, mat);
+  disc.scale.set(body.sizePx, body.sizePx, 1);
+  if (body.name === 'saturn') disc.add(_buildSaturnRing());
+  group.add(disc);
 
   return group;
 }
@@ -1150,15 +1209,22 @@ function updatePlanetPositions() {
     const { x, y, z } = Astro.altAzToXYZ(alt, az);
     obj.position.set(x, y, z).multiplyScalar(PLANET_RADIUS);
 
-    // Sprites (Sun, and every other body) billboard to face the camera
-    // automatically as part of how Three.js renders them — that's baked into
-    // the old orthographic-camera design too, so it kept working unchanged.
-    // The Moon is the one Mesh (needed for its phase shader, which a Sprite's
-    // fixed quad-facing-camera trick can't drive), so unlike a Sprite it does
-    // NOT auto-face the eye — with the eye fixed at the origin, lookAt(0,0,0)
-    // re-orients it to face inward every tick as it moves across the sphere.
-    if (body.name === 'moon') {
+    // Sprites (Sun, and the flat-dot fallback for any untextured body)
+    // billboard to face the camera automatically as part of how Three.js
+    // renders them — that's baked into the old orthographic-camera design
+    // too, so it kept working unchanged. The Moon (a Mesh, for its phase
+    // shader) and the sphere-impostor planet billboards (Groups containing a
+    // Mesh, for PLANET_FRAG) don't get that automatic treatment, so unlike a
+    // Sprite they do NOT auto-face the eye — with the eye fixed at the
+    // origin, lookAt(0,0,0) re-orients them to face inward every tick as they
+    // move across the sphere. (A Group's rotation doesn't perturb its child
+    // Sprites' own billboarding — Three's sprite shader derives facing from
+    // the camera, not the object's rotation — so this is safe for the
+    // planets' halo-plus-disc Groups too.)
+    if (body.name === 'moon' || PLANET_TEXTURES[body.name]) {
       obj.lookAt(0, 0, 0);
+    }
+    if (body.name === 'moon') {
       // Moon is a Mesh with a phase shader (see MOON_FRAG) — its uniforms
       // need refreshing too, not just its position/orientation. Phase changes
       // slowly (~12h per 1% of a cycle) so this only needs to keep pace with
