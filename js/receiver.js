@@ -629,33 +629,70 @@ const SCREEN_QUAD_VERT = `
   }
 `;
 
-// Sun: unlike the 7 planets, sun_disc.webp is already a circularly-masked
-// crop (see generate_cast_sun_disc.py) rather than a full equirectangular
-// map, so the disc is sampled directly through vUv — no sphere-normal
-// reconstruction needed. The warm glow beyond the disc replaces the old
-// separate additive Sprite halo (see SCREEN_QUAD_VERT's doc comment for why
-// that had to move in here).
-const SUN_GLOW_OUTER = 2.2;   // matches the old halo Sprite's 2.2x-disc scale
+// Sun: a direct port of the phone app's animated corona (SkyShaders.kt's
+// PLANET_SPHERE_FRAGMENT, the uSelfLuminous branch) rather than a static
+// texture + fading halo. Per that shader's own comment: "there is no sphere
+// here at all, only a glow that happens to be saturated in the middle... a
+// hard circular edge... read as a sticker pasted onto the sky: real light has
+// no boundary you can point at." So — same as the phone — there's no
+// sun_disc.webp sampling at all; the whole disc-and-corona is procedural,
+// animated by uTimeSeconds, with no texture input.
 const SUN_FRAG = `
-  uniform sampler2D uMap;
-  uniform float uQuadScale;
+  uniform float uTimeSeconds;
+  uniform float uDiscRadiusUV;
   varying vec2 vUv;
 
+  const float PI = 3.14159265359;
+
+  // Base frequency for every animation below: exactly one full turn per the
+  // 100 seconds uTimeSeconds is wrapped at on the JS side (see _buildSunSprite
+  // and the animate() loop) — matching PlanetSphereRenderer.SUN_ANIM_WRAP_MS.
+  // Every rate here is an INTEGER multiple of it so each phase advances a
+  // whole number of turns across that wrap and comes out exactly where it
+  // left off; a non-multiple rate would jump to an unrelated phase every 100
+  // seconds and the starburst would visibly stutter.
+  const float RATE = 0.06283185;   // 2*PI / 100 s
+
+  float sunShards(float angle, float radialT, float t) {
+    float near = 1.0 - radialT;
+    float warped = angle + 0.45 * sin(angle + 0.7) + 0.22 * sin(2.0 * angle + 2.3);
+    float envA = 0.35 + 0.65 * (0.5 + 0.5 * sin(angle * 2.0 - 0.9));
+    float envB = 0.30 + 0.70 * (0.5 + 0.5 * sin(angle * 3.0 + 2.1));
+    float envC = 0.40 + 0.60 * (0.5 + 0.5 * sin(angle * 5.0 + 0.4));
+    float a = 0.5 + 0.5 * sin(warped * 19.0 + t * 5.0 * RATE);
+    float b = 0.5 + 0.5 * sin(warped *  9.0 - t * 3.0 * RATE + 1.7);
+    float c = 0.5 + 0.5 * sin(warped * 37.0 + t * 2.0 * RATE + 4.2);
+    return pow(a, 7.0) * 0.45 * envA * pow(near, 3.0)
+         + pow(b, 9.0) * 0.42 * envB * pow(near, 1.7)
+         + pow(c, 8.0) * 0.28 * envC * pow(near, 5.0);
+  }
+
   void main() {
-    vec2 p = (vUv * 2.0 - 1.0) * uQuadScale;
-    float r = length(p);
+    vec2 p = vUv * 2.0 - 1.0;
+    float rQuad = length(p);
+    if (rQuad > 1.0) discard;
 
-    if (r > 1.0) {
-      if (r > ${SUN_GLOW_OUTER}) discard;
-      float t = (r - 1.0) / (${SUN_GLOW_OUTER} - 1.0);
-      float alpha = (1.0 - smoothstep(0.0, 1.0, t)) * 0.55;
-      gl_FragColor = vec4(1.0, 0.949, 0.690, alpha);   // #fff2b0, the old halo colour
-      return;
-    }
+    float angle = atan(p.y, p.x);
+    float limb = uDiscRadiusUV;
+    float t = clamp((rQuad - limb) / (1.0 - limb), 0.0, 1.0);
 
-    vec4 tex = texture2D(uMap, vUv);
-    float edgeAlpha = 1.0 - smoothstep(0.94, 1.0, r);
-    gl_FragColor = vec4(tex.rgb, tex.a * edgeAlpha);
+    float core  = 1.0 - smoothstep(limb * 0.35, limb * 1.30, rQuad);
+    float bloom = pow(1.0 - t, 12.0);
+    float halo  = pow(1.0 - t, 1.8);
+    float shard = sunShards(angle, t, uTimeSeconds) * smoothstep(0.0, 0.10, t);
+
+    float shimmer = 0.86 + 0.09 * sin(uTimeSeconds * 15.0 * RATE + angle * 2.0)
+                         + 0.05 * sin(uTimeSeconds * 26.0 * RATE - angle * 3.0);
+    float intensity = (core * 1.9 + bloom * 1.05 + halo * 0.34 + shard * 0.62) * shimmer;
+    if (intensity <= 0.003) discard;
+
+    vec3 emberGlow = vec3(0.40, 0.15, 0.05);
+    vec3 warmGlow  = vec3(1.00, 0.62, 0.24);
+    vec3 hotGlow   = vec3(1.00, 0.96, 0.86);
+    vec3 glowColor = mix(emberGlow, warmGlow, smoothstep(0.0, 0.25, intensity));
+    glowColor = mix(glowColor, hotGlow, smoothstep(0.28, 0.80, intensity));
+
+    gl_FragColor = vec4(glowColor, min(intensity, 1.0));
   }
 `;
 
@@ -675,7 +712,6 @@ const SAT_FRAG = `
 const PLANET_FRAG = `
   uniform sampler2D uMap;
   uniform float uQuadScale;
-  uniform vec3 uGlowColor;
   #ifdef HAS_RING
   uniform sampler2D uRingMap;
   #endif
@@ -688,43 +724,26 @@ const PLANET_FRAG = `
   const float RING_INNER  = 1.1;
   const float RING_OUTER  = 1.8;
   const float RING_SQUASH = 0.45;
-  // Soft glow reaching out to this many globe radii — drawn in this same
-  // screen-space quad (see uGlowColor below) rather than as a separate
-  // Sprite: a Sprite has a world-space extent, so under applyAim()'s
-  // homography (a general, non-conformal projective map — see SCREEN_QUAD_VERT's
-  // comment) it stretches into the "oblong shape" a fixed-size quad always
-  // does once it drifts off the calibrated surface's centre. Folding the glow
-  // into this shader means it's built from the same already-round screen-
-  // space disc, so it inherits the fix instead of needing its own.
-  const float GLOW_OUTER = 1.6;
 
   void main() {
     // Globe-relative coords: radius 1 is the globe's limb, whatever the quad
-    // was widened to (uQuadScale) to make room for the ring/glow.
+    // was widened to (uQuadScale) to make room for Saturn's ring.
     vec2 p = (vUv * 2.0 - 1.0) * uQuadScale;
     float r2 = dot(p, p);
 
     if (r2 > 1.0) {
-      float r = sqrt(r2);
-      vec3 color = uGlowColor;
-      float alpha = 0.0;
-      if (r <= GLOW_OUTER) {
-        float t = (r - 1.0) / (GLOW_OUTER - 1.0);
-        alpha = (1.0 - smoothstep(0.0, 1.0, t)) * 0.35;
-      }
       #ifdef HAS_RING
         vec2 ringP = vec2(p.x, p.y / RING_SQUASH);
         float ringR = length(ringP);
         if (ringR >= RING_INNER && ringR <= RING_OUTER) {
           // saturn_ring.webp is a radial strip: across = inner edge -> outer edge.
           vec4 ring = texture2D(uRingMap, vec2((ringR - RING_INNER) / (RING_OUTER - RING_INNER), 0.5));
-          color = mix(color, ring.rgb, ring.a);
-          alpha = mix(alpha, 1.0, ring.a);
+          if (ring.a <= 0.001) discard;
+          gl_FragColor = ring;
+          return;
         }
       #endif
-      if (alpha <= 0.001) discard;
-      gl_FragColor = vec4(color, alpha);
-      return;
+      discard;
     }
 
     // Reconstruct a unit-sphere normal from disc-local (x,y) — same core
@@ -904,11 +923,11 @@ function initScene() {
   // ── Sun, Moon, planets ──────────────────────────────────────────────────
   // One object per body, built once here (only 9 of them — no pooling needed
   // like the variable-count satellites) and repositioned in updatePlanetPositions().
-  // `planetSprites[name]` always holds the billboard disc itself — for the
-  // Sun and the 7 textured planets, the glow (and for Saturn, the ring) is
-  // drawn inside that disc's own shader rather than as a separate child
-  // object (see SCREEN_QUAD_VERT's doc comment for why: a second world-space
-  // quad would distort even though the disc it rides beside doesn't).
+  // `planetSprites[name]` always holds the billboard disc itself — the Sun's
+  // glow and Saturn's ring are drawn inside their own disc's shader rather
+  // than as separate child objects (see SCREEN_QUAD_VERT's doc comment for
+  // why: a second world-space quad would distort even though the disc it
+  // rides beside doesn't). The other 6 planets have no glow at all.
   //
   // Mercury/Venus/Mars/Jupiter/Saturn/Uranus/Neptune each get their own
   // equirectangular surface texture mapped via a sphere-impostor billboard
@@ -1248,12 +1267,11 @@ function _dotTexture(colorHex) {
   return tex;
 }
 
-// ── Real texture assets (Sun disc, Moon, Saturn's ring) ────────────────────
-// Loaded from the same source images the phone app ships (see
-// tools/generate_cast_star_catalog.py's sibling, generate_cast_sun_disc.py,
-// for how sun_disc.webp was derived). Loading is async — Three.js renders the
-// mesh untextured for a frame or two until each texture arrives, which is
-// unnoticeable at boot.
+// ── Real texture assets (Moon, planets, Saturn's ring) ─────────────────────
+// Loaded from the same source images the phone app ships. Loading is async —
+// Three.js renders the mesh untextured for a frame or two until each texture
+// arrives, which is unnoticeable at boot. The Sun has no texture at all (see
+// SUN_FRAG's doc comment) — it's the one body that never calls this.
 const _textureLoader = new THREE.TextureLoader();
 function _loadTexture(fileName) {
   return _textureLoader.load(`assets/planet-textures/${fileName}`);
@@ -1270,14 +1288,24 @@ function _syncHalfViewport() {
 
 // Roughly doubles the Sun's rendered size vs. planets.js's SIZE_PX.sun — a
 // display choice (per the user), not a change to how large it should really
-// look; SUN_GLOW_OUTER's ratio to the disc stays the same either way.
+// look; SUN_DISC_RADIUS_UV's ratio to the full quad stays the same either way.
 const SUN_SIZE_MULTIPLIER = 2.0;
-const SUN_QUAD_SCALE = SUN_GLOW_OUTER + 0.1;   // a hair of margin past the glow
+// Exactly PlanetSphereRenderer.SUN_GLOW_QUAD_SCALE (5.5) on the phone: the
+// quad is drawn 5.5x the disc's own radius to leave room for the corona, and
+// SUN_DISC_RADIUS_UV (1/5.5) is where SUN_FRAG's "limb" sits inside that
+// oversized quad — see PlanetSphereRenderer.kt:332-334.
+const SUN_QUAD_SCALE = 5.5;
+const SUN_DISC_RADIUS_UV = 1.0 / SUN_QUAD_SCALE;
+// Wrapped at 100s in animate() below to keep the shard harmonics' phase
+// exact across the wrap (see SUN_FRAG's RATE comment) — matches
+// PlanetSphereRenderer.SUN_ANIM_WRAP_MS (100_000ms) exactly.
+const SUN_ANIM_WRAP_SECONDS = 100;
 
 function _buildSunSprite(body) {
   const mat = new THREE.ShaderMaterial({
     uniforms: {
-      uMap:          { value: _loadTexture('sun_disc.webp') },
+      uTimeSeconds:  { value: 0 },
+      uDiscRadiusUV: { value: SUN_DISC_RADIUS_UV },
       uHalfViewport: { value: _halfViewport },
       uWorldRadius:  { value: body.sizePx * 0.5 * SUN_SIZE_MULTIPLIER },
       uQuadScale:    { value: SUN_QUAD_SCALE },
@@ -1309,7 +1337,7 @@ function _buildMoonMesh(body) {
 }
 
 // Real per-body equirectangular textures (generated by the same pipeline as
-// sun_disc.webp/moon.webp — see tools/generate_cast_star_catalog.py's siblings).
+// moon.webp — see tools/generate_cast_star_catalog.py's siblings).
 //
 // Downscaled to 128x64: these bodies render at sizePx 6-14px on screen (see
 // planets.js's SIZE_PX), so the original 1024x512 sources — ~2MB each once
@@ -1343,25 +1371,23 @@ const PLANET_TEXTURES = {
 // Saturn's ring is drawn by the same fragment shader on a widened quad (the
 // HAS_RING define) rather than as its own child mesh: a child mesh would be
 // back to having a world-space extent, and would come out sheared and
-// detached from the globe it's supposed to be wrapped around. The glow is
-// folded in the same way (see PLANET_FRAG's GLOW_OUTER) rather than a
-// separate Sprite, for the same reason — see its doc comment there.
-const GLOW_QUAD_SCALE  = 1.7;   // room for GLOW_OUTER (1.6 globe radii) plus a hair of margin
+// detached from the globe it's supposed to be wrapped around. No glow — the
+// user found it unnecessary once the disc itself was rendering correctly.
 const SATURN_QUAD_SCALE = 2.0;   // room for RING_OUTER (1.8 globe radii) plus margin
-// Per the user: planets 2x larger — same kind of display-size knob as
+// Per the user: planets 2x larger on top of the previous doubling (4x their
+// original planets.js SIZE_PX) — same kind of display-size knob as
 // SUN_SIZE_MULTIPLIER, not a change to how large they should really look.
-const PLANET_SIZE_MULTIPLIER = 2.0;
+const PLANET_SIZE_MULTIPLIER = 4.0;
 
 function _buildPlanetBillboard(body, textureFile) {
   const hasRing = body.name === 'saturn';
   const uniforms = {
     uMap:          { value: _loadTexture(textureFile) },
     uHalfViewport: { value: _halfViewport },
-    uGlowColor:    { value: new THREE.Color(body.color) },
     // The quad used to be scale.set(sizePx, sizePx, 1) on a PlaneGeometry(1,1),
     // i.e. a half-extent of sizePx/2 world units — that's the globe's radius.
     uWorldRadius:  { value: body.sizePx * 0.5 * PLANET_SIZE_MULTIPLIER },
-    uQuadScale:    { value: hasRing ? SATURN_QUAD_SCALE : GLOW_QUAD_SCALE },
+    uQuadScale:    { value: hasRing ? SATURN_QUAD_SCALE : 1.0 },
   };
   if (hasRing) uniforms.uRingMap = { value: _loadTexture('saturn_ring.webp') };
 
@@ -1675,6 +1701,13 @@ function animate() {
     _lastStarMs = Date.now();
   }
   if (starsMaterial) starsMaterial.uniforms.uTime.value = (performance.now() - _clockStart) / 1000;
+  // Wrapped at SUN_ANIM_WRAP_SECONDS (100s) — see SUN_FRAG's RATE comment for
+  // why the wrap period has to stay exact, not just "large enough".
+  const sunObj = planetSprites.sun;
+  if (sunObj) {
+    sunObj.material.uniforms.uTimeSeconds.value =
+      ((performance.now() - _clockStart) / 1000) % SUN_ANIM_WRAP_SECONDS;
+  }
   renderer.render(scene, camera);
   drawSelectionOverlay();
 }
