@@ -388,20 +388,67 @@ function applyWarp(corners) {
   // A projective CSS transform makes every circular marker and label locally
   // anisotropic. Keep the rendered sky isotropic and use the quad only as a
   // mask; uncovered parts of a non-rectangular calibration stay black.
-  const clipPoints = points.map(point => {
-    const x = ((point.x * W - offsetX) / scale / W) * 100;
-    const y = ((point.y * H - offsetY) / scale / H) * 100;
-    return `${x.toFixed(4)}% ${y.toFixed(4)}%`;
-  });
+  //
+  // Positions here are fractions of the canvas box (0..1), not percentages, so
+  // coversBox() below can reason about them geometrically.
+  const clipFractions = points.map(point => ({
+    x: (point.x * W - offsetX) / scale / W,
+    y: (point.y * H - offsetY) / scale / H,
+  }));
+
+  // A clip-path that doesn't actually cut anything is not free — on a
+  // Chromecast it is by far the most expensive thing this app does. Measured on
+  // device (Chrome 90 / CrKey 1.56, 1080p): the two full-screen canvas layers
+  // below cost ~66ms per frame between them purely in compositor masking work,
+  // against a ~30ms floor for an empty requestAnimationFrame loop — i.e. half
+  // the entire frame budget, and more than rendering the 8,870-star scene
+  // itself (~21ms). That dragged the receiver to ~7fps with repeated
+  // 400-900ms compositor stalls, which is what reads as the projected image
+  // intermittently blanking out.
+  //
+  // The common case pays that for nothing: a calibration that isn't keystoned
+  // produces exactly `polygon(0% 0%, 100% 0%, 100% 100%, 0% 100%)` — the whole
+  // box, masking zero pixels. So only set a clip when the quad genuinely cuts
+  // into the canvas, and let the far more common full-coverage case composite
+  // unmasked.
+  const clip = quadCoversBox(clipFractions)
+    ? 'none'
+    : `polygon(${clipFractions.map(p => `${(p.x * 100).toFixed(4)}% ${(p.y * 100).toFixed(4)}%`).join(', ')})`;
+
   // Selection overlay gets the exact same isotropic transform/clip as the sky
   // canvas, so a marker drawn as a true circle in canvas-pixel space stays a
   // true circle after this uniform (non-projective) scale is applied.
   for (const el of [canvasEl, selectionCanvasEl]) {
     el.style.transformOrigin = '0px 0px';
     el.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${scale})`;
-    el.style.clipPath = `polygon(${clipPoints.join(', ')})`;
+    el.style.clipPath = clip;
   }
-  console.log('[Warp] Uniform scale and clip applied');
+  console.log(`[Warp] Uniform scale applied; clip=${clip === 'none' ? 'none (quad covers frame)' : 'polygon'}`);
+}
+
+// Does this convex quad contain the whole canvas box, so clipping to it would
+// be a no-op? True whenever all four box corners are inside the quad — which
+// also correctly covers a quad *larger* than the box, as the scale = min(w, h)
+// arithmetic above can produce for a non-square calibration.
+//
+// Convexity lets this be four consistent-sign cross products per corner:
+// walking the quad's edges in order, an interior point stays on the same side
+// of every edge. Sign, not winding, is what matters, so accept all-positive or
+// all-negative rather than assuming an orientation. `>= 0` treats a point
+// exactly on an edge as inside: a quad that lines up flush with the box edge
+// is precisely the no-clip-needed case.
+function quadCoversBox(quad) {
+  const contains = (px, py) => {
+    let pos = 0, neg = 0;
+    for (let i = 0; i < 4; i++) {
+      const a = quad[i], b = quad[(i + 1) % 4];
+      const cross = (b.x - a.x) * (py - a.y) - (b.y - a.y) * (px - a.x);
+      if (cross > 1e-9) pos++;
+      else if (cross < -1e-9) neg++;
+    }
+    return pos === 0 || neg === 0;
+  };
+  return contains(0, 0) && contains(1, 0) && contains(1, 1) && contains(0, 1);
 }
 
 // ─── Three.js scene ───────────────────────────────────────────────────────────
@@ -959,9 +1006,30 @@ function projectToScreen(azDeg, altDeg) {
   };
 }
 
+// A full-viewport canvas costs real time on a Chromecast just by being in the
+// compositor's layer list, whether or not anything is drawn into it: measured
+// on device at ~22ms per frame, against a ~30ms floor for an empty frame. That
+// was being paid continuously to display a marker that is only ever present
+// while the phone has something selected — which is almost never, for a
+// receiver designed to run unattended after the phone disconnects. display:none
+// takes the layer out of compositing entirely; clearing the canvas does not.
+//
+// Written only on transitions, since assigning to .style every frame is itself
+// a layout/style invalidation.
+let _selectionCanvasVisible = true;
+function _showSelectionCanvas(show) {
+  if (show === _selectionCanvasVisible) return;
+  _selectionCanvasVisible = show;
+  selectionCanvasEl.style.display = show ? '' : 'none';
+}
+
 function drawSelectionOverlay() {
+  if (!selection.visible) {
+    _showSelectionCanvas(false);
+    return;
+  }
+  _showSelectionCanvas(true);
   selectionCtx.clearRect(0, 0, selectionCanvasEl.width, selectionCanvasEl.height);
-  if (!selection.visible) return;
   const { az, alt } = trackedSelectionAltAz();
   const pt = projectToScreen(az, alt);
   if (!pt) return;
