@@ -562,7 +562,8 @@ const MOON_FRAG = `
   }
 `;
 
-// Sphere-impostor shaders for Mercury/Venus/Mars/Jupiter/Saturn/Uranus/Neptune.
+// Shared vertex shader for every billboarded object that has to stay a true
+// circle: the Sun, the 7 textured planets, and the satellite glyphs.
 //
 // THE QUAD IS BUILT IN SCREEN SPACE, NOT WORLD SPACE. This is the whole point
 // of the vertex shader below, and it's the same thing the phone app's
@@ -577,10 +578,14 @@ const MOON_FRAG = `
 // single POINT is never distorted by projecting it, only extended shapes are.
 // So project only the body's centre through the homography, then lay the quad
 // out around that centre in screen space, where it stays perfectly circular.
-const PLANET_VERT = `
+// This is also why the Sun's glow and the planets' glow/ring are drawn inside
+// their fragment shaders rather than as separate Sprites — a second
+// world-space quad parented alongside a correctly-round disc would still
+// itself distort into the "oblong shape" this shader exists to avoid.
+const SCREEN_QUAD_VERT = `
   uniform vec2  uHalfViewport;  // (canvas width, height) / 2, in CSS px
-  uniform float uWorldRadius;   // globe radius in world units at the sky sphere
-  uniform float uQuadScale;     // 1.0 normally; >1 to leave room for Saturn's ring
+  uniform float uWorldRadius;   // body radius in world units at the sky sphere
+  uniform float uQuadScale;     // 1.0 normally; >1 to leave room for a glow/ring
   varying vec2 vUv;
 
   void main() {
@@ -623,9 +628,54 @@ const PLANET_VERT = `
     gl_Position = vec4((centreNdc + offset) * c.w, 0.0, c.w);
   }
 `;
+
+// Sun: unlike the 7 planets, sun_disc.webp is already a circularly-masked
+// crop (see generate_cast_sun_disc.py) rather than a full equirectangular
+// map, so the disc is sampled directly through vUv — no sphere-normal
+// reconstruction needed. The warm glow beyond the disc replaces the old
+// separate additive Sprite halo (see SCREEN_QUAD_VERT's doc comment for why
+// that had to move in here).
+const SUN_GLOW_OUTER = 2.2;   // matches the old halo Sprite's 2.2x-disc scale
+const SUN_FRAG = `
+  uniform sampler2D uMap;
+  uniform float uQuadScale;
+  varying vec2 vUv;
+
+  void main() {
+    vec2 p = (vUv * 2.0 - 1.0) * uQuadScale;
+    float r = length(p);
+
+    if (r > 1.0) {
+      if (r > ${SUN_GLOW_OUTER}) discard;
+      float t = (r - 1.0) / (${SUN_GLOW_OUTER} - 1.0);
+      float alpha = (1.0 - smoothstep(0.0, 1.0, t)) * 0.55;
+      gl_FragColor = vec4(1.0, 0.949, 0.690, alpha);   // #fff2b0, the old halo colour
+      return;
+    }
+
+    vec4 tex = texture2D(uMap, vUv);
+    float edgeAlpha = 1.0 - smoothstep(0.94, 1.0, r);
+    gl_FragColor = vec4(tex.rgb, tex.a * edgeAlpha);
+  }
+`;
+
+// Satellite glyphs: the canvas textures built by _getSatGlyphTexture() /
+// _getIssGlyphTexture() already carry their own soft glow and transparency
+// baked into the pixels (see those functions), so the fragment shader here
+// just samples straight through — SCREEN_QUAD_VERT alone is what keeps the
+// glyph from shearing into the "oblong shape" a world-space Sprite quad
+// suffered from.
+const SAT_FRAG = `
+  uniform sampler2D uMap;
+  varying vec2 vUv;
+  void main() {
+    gl_FragColor = texture2D(uMap, vUv);
+  }
+`;
 const PLANET_FRAG = `
   uniform sampler2D uMap;
   uniform float uQuadScale;
+  uniform vec3 uGlowColor;
   #ifdef HAS_RING
   uniform sampler2D uRingMap;
   #endif
@@ -638,25 +688,43 @@ const PLANET_FRAG = `
   const float RING_INNER  = 1.1;
   const float RING_OUTER  = 1.8;
   const float RING_SQUASH = 0.45;
+  // Soft glow reaching out to this many globe radii — drawn in this same
+  // screen-space quad (see uGlowColor below) rather than as a separate
+  // Sprite: a Sprite has a world-space extent, so under applyAim()'s
+  // homography (a general, non-conformal projective map — see SCREEN_QUAD_VERT's
+  // comment) it stretches into the "oblong shape" a fixed-size quad always
+  // does once it drifts off the calibrated surface's centre. Folding the glow
+  // into this shader means it's built from the same already-round screen-
+  // space disc, so it inherits the fix instead of needing its own.
+  const float GLOW_OUTER = 1.6;
 
   void main() {
     // Globe-relative coords: radius 1 is the globe's limb, whatever the quad
-    // was widened to (uQuadScale) to make room for the ring.
+    // was widened to (uQuadScale) to make room for the ring/glow.
     vec2 p = (vUv * 2.0 - 1.0) * uQuadScale;
     float r2 = dot(p, p);
 
     if (r2 > 1.0) {
+      float r = sqrt(r2);
+      vec3 color = uGlowColor;
+      float alpha = 0.0;
+      if (r <= GLOW_OUTER) {
+        float t = (r - 1.0) / (GLOW_OUTER - 1.0);
+        alpha = (1.0 - smoothstep(0.0, 1.0, t)) * 0.35;
+      }
       #ifdef HAS_RING
         vec2 ringP = vec2(p.x, p.y / RING_SQUASH);
         float ringR = length(ringP);
-        if (ringR < RING_INNER || ringR > RING_OUTER) discard;
-        // saturn_ring.webp is a radial strip: across = inner edge -> outer edge.
-        vec4 ring = texture2D(uRingMap, vec2((ringR - RING_INNER) / (RING_OUTER - RING_INNER), 0.5));
-        gl_FragColor = ring;
-        return;
-      #else
-        discard;
+        if (ringR >= RING_INNER && ringR <= RING_OUTER) {
+          // saturn_ring.webp is a radial strip: across = inner edge -> outer edge.
+          vec4 ring = texture2D(uRingMap, vec2((ringR - RING_INNER) / (RING_OUTER - RING_INNER), 0.5));
+          color = mix(color, ring.rgb, ring.a);
+          alpha = mix(alpha, 1.0, ring.a);
+        }
       #endif
+      if (alpha <= 0.001) discard;
+      gl_FragColor = vec4(color, alpha);
+      return;
     }
 
     // Reconstruct a unit-sphere normal from disc-local (x,y) — same core
@@ -836,9 +904,11 @@ function initScene() {
   // ── Sun, Moon, planets ──────────────────────────────────────────────────
   // One object per body, built once here (only 9 of them — no pooling needed
   // like the variable-count satellites) and repositioned in updatePlanetPositions().
-  // `planetSprites[name]` always holds the object whose .position gets updated —
-  // for Sun/Saturn that's the "primary" sprite, with the glow halo / ring as a
-  // child so it rides along automatically without separate position tracking.
+  // `planetSprites[name]` always holds the billboard disc itself — for the
+  // Sun and the 7 textured planets, the glow (and for Saturn, the ring) is
+  // drawn inside that disc's own shader rather than as a separate child
+  // object (see SCREEN_QUAD_VERT's doc comment for why: a second world-space
+  // quad would distort even though the disc it rides beside doesn't).
   //
   // Mercury/Venus/Mars/Jupiter/Saturn/Uranus/Neptune each get their own
   // equirectangular surface texture mapped via a sphere-impostor billboard
@@ -1190,7 +1260,7 @@ function _loadTexture(fileName) {
 }
 
 // Half the canvas size in CSS px, shared by reference with every planet
-// material's uHalfViewport uniform (PLANET_VERT needs it to convert a screen
+// material's uHalfViewport uniform (SCREEN_QUAD_VERT needs it to convert a screen
 // -space radius into NDC). Mutated in place by _syncHalfViewport() so all of
 // those materials pick the new size up without being walked individually.
 const _halfViewport = new THREE.Vector2(window.innerWidth / 2, window.innerHeight / 2);
@@ -1198,26 +1268,28 @@ function _syncHalfViewport() {
   _halfViewport.set(window.innerWidth / 2, window.innerHeight / 2);
 }
 
+// Roughly doubles the Sun's rendered size vs. planets.js's SIZE_PX.sun — a
+// display choice (per the user), not a change to how large it should really
+// look; SUN_GLOW_OUTER's ratio to the disc stays the same either way.
+const SUN_SIZE_MULTIPLIER = 2.0;
+const SUN_QUAD_SCALE = SUN_GLOW_OUTER + 0.1;   // a hair of margin past the glow
+
 function _buildSunSprite(body) {
-  const group = new THREE.Group();
-
-  // Soft additive glow behind the disc — the "glowing" part of "glowing sun."
-  const halo = new THREE.Sprite(new THREE.SpriteMaterial({
-    map: _dotTexture('#fff2b0'), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
-  }));
-  halo.scale.set(body.sizePx * 2.2, body.sizePx * 2.2, 1);
-  halo.position.z = -0.05;
-  group.add(halo);
-
-  // Real (circularly-masked) sun texture on top — normal blending, not
-  // additive, so it reads as a solid disc rather than washing out into the halo.
-  const disc = new THREE.Sprite(new THREE.SpriteMaterial({
-    map: _loadTexture('sun_disc.webp'), transparent: true, depthWrite: false,
-  }));
-  disc.scale.set(body.sizePx, body.sizePx, 1);
-  group.add(disc);
-
-  return group;
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uMap:          { value: _loadTexture('sun_disc.webp') },
+      uHalfViewport: { value: _halfViewport },
+      uWorldRadius:  { value: body.sizePx * 0.5 * SUN_SIZE_MULTIPLIER },
+      uQuadScale:    { value: SUN_QUAD_SCALE },
+    },
+    vertexShader: SCREEN_QUAD_VERT, fragmentShader: SUN_FRAG,
+    transparent: true, depthWrite: false,
+  });
+  const disc = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
+  // Screen-space sizing (see SCREEN_QUAD_VERT) makes the CPU-side bounding
+  // sphere meaningless for culling — same reasoning as the planets' discs.
+  disc.frustumCulled = false;
+  return disc;
 }
 
 function _buildMoonMesh(body) {
@@ -1264,45 +1336,39 @@ const PLANET_TEXTURES = {
 // whose fragment shader reconstructs a unit-sphere normal per pixel and
 // samples the equirectangular texture through it. Same technique as the phone
 // app (SkyShaders.kt's PLANET_SPHERE_VERTEX / PLANET_SPHERE_FRAGMENT). See
-// PLANET_VERT's comment for why the quad has to be laid out in screen space
+// SCREEN_QUAD_VERT's comment for why the quad has to be laid out in screen space
 // rather than world space — that, not the texturing, is what keeps these
 // round under applyAim()'s homography.
 //
 // Saturn's ring is drawn by the same fragment shader on a widened quad (the
 // HAS_RING define) rather than as its own child mesh: a child mesh would be
 // back to having a world-space extent, and would come out sheared and
-// detached from the globe it's supposed to be wrapped around.
+// detached from the globe it's supposed to be wrapped around. The glow is
+// folded in the same way (see PLANET_FRAG's GLOW_OUTER) rather than a
+// separate Sprite, for the same reason — see its doc comment there.
+const GLOW_QUAD_SCALE  = 1.7;   // room for GLOW_OUTER (1.6 globe radii) plus a hair of margin
 const SATURN_QUAD_SCALE = 2.0;   // room for RING_OUTER (1.8 globe radii) plus margin
+// Per the user: planets 2x larger — same kind of display-size knob as
+// SUN_SIZE_MULTIPLIER, not a change to how large they should really look.
+const PLANET_SIZE_MULTIPLIER = 2.0;
 
 function _buildPlanetBillboard(body, textureFile) {
-  const group = new THREE.Group();
-
-  // Faint additive glow behind the disc, same treatment as the Sun's halo —
-  // keeps the planet easy to spot before the eye resolves the tiny disc. Left
-  // as a plain Sprite: the homography distorts it too, but it's a soft radial
-  // gradient with no shape to lose.
-  const halo = new THREE.Sprite(new THREE.SpriteMaterial({
-    map: _dotTexture(body.color), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
-  }));
-  halo.scale.set(body.sizePx * 1.8, body.sizePx * 1.8, 1);
-  halo.position.z = -0.05;
-  group.add(halo);
-
   const hasRing = body.name === 'saturn';
   const uniforms = {
     uMap:          { value: _loadTexture(textureFile) },
     uHalfViewport: { value: _halfViewport },
+    uGlowColor:    { value: new THREE.Color(body.color) },
     // The quad used to be scale.set(sizePx, sizePx, 1) on a PlaneGeometry(1,1),
     // i.e. a half-extent of sizePx/2 world units — that's the globe's radius.
-    uWorldRadius:  { value: body.sizePx * 0.5 },
-    uQuadScale:    { value: hasRing ? SATURN_QUAD_SCALE : 1.0 },
+    uWorldRadius:  { value: body.sizePx * 0.5 * PLANET_SIZE_MULTIPLIER },
+    uQuadScale:    { value: hasRing ? SATURN_QUAD_SCALE : GLOW_QUAD_SCALE },
   };
   if (hasRing) uniforms.uRingMap = { value: _loadTexture('saturn_ring.webp') };
 
   const mat = new THREE.ShaderMaterial({
     uniforms,
     defines: hasRing ? { HAS_RING: '' } : {},
-    vertexShader: PLANET_VERT, fragmentShader: PLANET_FRAG,
+    vertexShader: SCREEN_QUAD_VERT, fragmentShader: PLANET_FRAG,
     transparent: true, depthWrite: false,
   });
   const disc = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
@@ -1310,9 +1376,7 @@ function _buildPlanetBillboard(body, textureFile) {
   // mesh's own scale stays 1 and its CPU-side bounding sphere no longer says
   // anything about where it lands — cull it by hand rather than wrongly.
   disc.frustumCulled = false;
-  group.add(disc);
-
-  return group;
+  return disc;
 }
 
 // ── Layer visibility ────────────────────────────────────────────────────────
@@ -1377,7 +1441,7 @@ function updatePlanetPositions() {
     // drive), so unlike a Sprite it does NOT auto-face the eye — with the eye
     // fixed at the origin, lookAt(0,0,0) re-orients it to face inward every
     // tick as it moves across the sphere. The textured planets need no
-    // orientation at all: PLANET_VERT lays their quad out in screen space
+    // orientation at all: SCREEN_QUAD_VERT lays their quad out in screen space
     // from their centre alone, so their mesh rotation is never read.
     if (body.name === 'moon') {
       // Moon is a Mesh with a phase shader (see MOON_FRAG) — its uniforms
@@ -1546,34 +1610,52 @@ function propagateSatellites() {
   _updateSatSprites(visible);
 }
 
+// Doubled again per the user's follow-up ("2x larger" on top of the previous
+// doubling from the glyph's original 20px-diameter/10px-radius size) — same
+// display-size choice as SUN_SIZE_MULTIPLIER/PLANET_SIZE_MULTIPLIER.
+const SAT_WORLD_RADIUS = 40;
+
 // Time: O(n) | Space: O(max concurrent visible satellites) — pool grows to the
-// high-water mark and is never shrunk (a handful of sprites is negligible).
+// high-water mark and is never shrunk (a handful of billboards is negligible).
+//
+// These used to be THREE.Sprite (a world-space quad), which is exactly the
+// shape SCREEN_QUAD_VERT's doc comment warns about: under applyAim()'s
+// homography it sheared into an oblong blob instead of the glyph's actual
+// silhouette, worst for satellites drifting near the calibrated quad's edges
+// — precisely where a tracked pass tends to go. Now a screen-space billboard
+// like the Sun/planets, so the glyph shape survives intact everywhere.
 function _updateSatSprites(sats) {
   while (_satSpritePool.length < sats.length) {
-    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
-      map: _getSatGlyphTexture(), transparent: true, depthWrite: false,
-    }));
-    sprite.scale.set(20, 20, 1);
-    _satSpritePool.push(sprite);
-    satGroup.add(sprite);
+    const mat = new THREE.ShaderMaterial({
+      uniforms: {
+        uMap:          { value: _getSatGlyphTexture() },
+        uHalfViewport: { value: _halfViewport },
+        uWorldRadius:  { value: SAT_WORLD_RADIUS },
+        uQuadScale:    { value: 1.0 },
+      },
+      vertexShader: SCREEN_QUAD_VERT, fragmentShader: SAT_FRAG,
+      transparent: true, depthWrite: false,
+    });
+    const billboard = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
+    billboard.frustumCulled = false;   // see the planets' discs for why
+    _satSpritePool.push(billboard);
+    satGroup.add(billboard);
   }
 
   for (let i = 0; i < _satSpritePool.length; i++) {
-    const sprite = _satSpritePool[i];
+    const billboard = _satSpritePool[i];
     if (i < sats.length) {
       // SAT_RADIUS < PLANET_RADIUS < SKY_RADIUS — see its declaration — puts
       // satellites in front of both planets and stars.
       const { x, y, z } = Astro.altAzToXYZ(sats[i].alt, sats[i].az);
-      sprite.position.set(x, y, z).multiplyScalar(SAT_RADIUS);
+      billboard.position.set(x, y, z).multiplyScalar(SAT_RADIUS);
       const wantIss = _isIssName(sats[i].name);
       const wantTex = wantIss ? _getIssGlyphTexture() : _getSatGlyphTexture();
-      if (sprite.material.map !== wantTex) {
-        sprite.material.map = wantTex;
-        sprite.material.needsUpdate = true;
-      }
-      sprite.visible = true;
+      const uMap = billboard.material.uniforms.uMap;
+      if (uMap.value !== wantTex) uMap.value = wantTex;
+      billboard.visible = true;
     } else {
-      sprite.visible = false;
+      billboard.visible = false;
     }
   }
 }
