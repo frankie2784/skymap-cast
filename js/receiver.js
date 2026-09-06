@@ -562,24 +562,102 @@ const MOON_FRAG = `
   }
 `;
 
-// Sphere-impostor shaders for Mercury/Venus/Mars/Jupiter/Saturn/Uranus/Neptune
-// — see _buildPlanetBillboard's doc comment for why a billboard+shader is
-// used instead of an actual 3D mesh sphere (an actual mesh sphere squishes
-// into an ellipse under perspective/fisheye projection when off-axis).
+// Sphere-impostor shaders for Mercury/Venus/Mars/Jupiter/Saturn/Uranus/Neptune.
+//
+// THE QUAD IS BUILT IN SCREEN SPACE, NOT WORLD SPACE. This is the whole point
+// of the vertex shader below, and it's the same thing the phone app's
+// PLANET_SPHERE_VERTEX does with its uRadiusClipX/uRadiusClipY (SkyShaders.kt).
+// applyAim() installs a general homography as camera.projectionMatrix, and an
+// arbitrary homography's local Jacobian is NOT conformal — it scales and
+// shears x and y by different amounts depending on where on screen you are.
+// So anything with a world-space extent (a Sprite's quad, a PlaneGeometry, an
+// actual mesh sphere) is projected into a stretched, slanted ellipse, worst
+// toward the calibrated quad's edges. The selection marker hit exactly this
+// and solved it the same way — see its comment above projectToScreen(): a
+// single POINT is never distorted by projecting it, only extended shapes are.
+// So project only the body's centre through the homography, then lay the quad
+// out around that centre in screen space, where it stays perfectly circular.
 const PLANET_VERT = `
+  uniform vec2  uHalfViewport;  // (canvas width, height) / 2, in CSS px
+  uniform float uWorldRadius;   // globe radius in world units at the sky sphere
+  uniform float uQuadScale;     // 1.0 normally; >1 to leave room for Saturn's ring
   varying vec2 vUv;
+
   void main() {
     vUv = uv;
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+
+    vec4 centreWorld = modelMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+    mat4 viewProj = projectionMatrix * viewMatrix;
+    vec4 c = viewProj * centreWorld;
+    // Behind the calibrated surface — push it outside the clip volume, same
+    // outcome the GPU gives the rest of the scene for w < 0.
+    if (c.w <= 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+    vec2 centreNdc = c.xy / c.w;
+
+    // Measure the homography's local scale AT THIS BODY'S OWN POSITION, by
+    // projecting two small world-space steps across the line of sight and
+    // seeing how far each moves on screen. Deriving the on-screen size this
+    // way (rather than hard-coding a pixel count) keeps a body's apparent
+    // size tied to the angle it really subtends, so it stays correct across
+    // projectors with different throws and across the frame.
+    vec3 dir = normalize(centreWorld.xyz);
+    vec3 tangentU = cross(dir, vec3(0.0, 1.0, 0.0));
+    // Degenerate only looking straight up/down, where any perpendicular will do.
+    if (length(tangentU) < 1.0e-4) tangentU = cross(dir, vec3(1.0, 0.0, 0.0));
+    tangentU = normalize(tangentU);
+    vec3 tangentV = cross(dir, tangentU);
+
+    vec4 a = viewProj * vec4(centreWorld.xyz + tangentU * uWorldRadius, 1.0);
+    vec4 b = viewProj * vec4(centreWorld.xyz + tangentV * uWorldRadius, 1.0);
+    vec2 stepA = (a.xy / a.w - centreNdc) * uHalfViewport;
+    vec2 stepB = (b.xy / b.w - centreNdc) * uHalfViewport;
+
+    // Geometric mean of the two axes: the radius of the circle with the same
+    // area as the ellipse the homography would otherwise have drawn, so the
+    // body keeps its apparent size and only its distortion is thrown away.
+    float radiusPx = sqrt(max(length(stepA) * length(stepB), 1.0e-6)) * uQuadScale;
+
+    vec2 offset = (uv * 2.0 - 1.0) * radiusPx / uHalfViewport;
+    // z = 0 (mid-range, always inside the depth clip) matches what applyAim()
+    // puts in the projection matrix — nothing here writes depth.
+    gl_Position = vec4((centreNdc + offset) * c.w, 0.0, c.w);
   }
 `;
 const PLANET_FRAG = `
   uniform sampler2D uMap;
+  uniform float uQuadScale;
+  #ifdef HAS_RING
+  uniform sampler2D uRingMap;
+  #endif
   varying vec2 vUv;
+
+  const float PI = 3.14159265359;
+  // Saturn's ring, in units of the globe's radius, and how far it's squashed
+  // vertically for a "tilted" look — the same 0.55-0.9 (of a half-extent 0.5
+  // quad) and 0.45 the old separate RingGeometry mesh used.
+  const float RING_INNER  = 1.1;
+  const float RING_OUTER  = 1.8;
+  const float RING_SQUASH = 0.45;
+
   void main() {
-    vec2 p = vUv * 2.0 - 1.0;
+    // Globe-relative coords: radius 1 is the globe's limb, whatever the quad
+    // was widened to (uQuadScale) to make room for the ring.
+    vec2 p = (vUv * 2.0 - 1.0) * uQuadScale;
     float r2 = dot(p, p);
-    if (r2 > 1.0) discard;
+
+    if (r2 > 1.0) {
+      #ifdef HAS_RING
+        vec2 ringP = vec2(p.x, p.y / RING_SQUASH);
+        float ringR = length(ringP);
+        if (ringR < RING_INNER || ringR > RING_OUTER) discard;
+        // saturn_ring.webp is a radial strip: across = inner edge -> outer edge.
+        vec4 ring = texture2D(uRingMap, vec2((ringR - RING_INNER) / (RING_OUTER - RING_INNER), 0.5));
+        gl_FragColor = ring;
+        return;
+      #else
+        discard;
+      #endif
+    }
 
     // Reconstruct a unit-sphere normal from disc-local (x,y) — same core
     // trick as the phone's PLANET_SPHERE_FRAGMENT (SkyShaders.kt) — so the
@@ -592,16 +670,16 @@ const PLANET_FRAG = `
     // receiver doesn't have. A fixed face is a reasonable simplification at
     // the ~6-14px this renders at — nowhere near large enough to notice the
     // planet isn't rotating.
-    float lon = atan(p.x, normal.z);
-    float lat = asin(p.y);
-    vec2 uv = vec2(0.5 + lon / (2.0 * 3.14159265359), 0.5 - lat / 3.14159265359);
+    float lon = atan(normal.x, normal.z);
+    float lat = asin(clamp(normal.y, -1.0, 1.0));
+    vec2 uvTex = vec2(0.5 + lon / (2.0 * PI), 0.5 - lat / PI);
 
     // Simple frontal Lambertian shading (light from the viewer) for a touch
     // of limb darkening — not the real phase/terminator, just enough to read
     // as a lit sphere rather than a flat decal.
     float lighting = 0.35 + 0.65 * normal.z;
 
-    vec3 color = texture2D(uMap, uv).rgb * lighting;
+    vec3 color = texture2D(uMap, uvTex).rgb * lighting;
     float edgeAlpha = 1.0 - smoothstep(0.94, 1.0, sqrt(r2));
     gl_FragColor = vec4(color, edgeAlpha);
   }
@@ -616,6 +694,7 @@ function initScene() {
   renderer = new THREE.WebGLRenderer({ canvas: canvasEl, antialias: true });
   renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize(window.innerWidth, window.innerHeight);
+  _syncHalfViewport();
   renderer.setClearColor(0x000000, 1);
   resizeSelectionCanvas();
 
@@ -800,6 +879,7 @@ function initScene() {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(window.innerWidth, window.innerHeight);
+      _syncHalfViewport();
     }
   });
 }
@@ -890,6 +970,7 @@ function applyAim(aim) {
   // fills the canvas. applyWarp() then uniformly places and clips that canvas
   // to the user's dragged output quad. Canvas therefore tracks the window.
   renderer.setSize(window.innerWidth, window.innerHeight);
+  _syncHalfViewport();
   resizeSelectionCanvas();
   if (appState === AppState.RUNNING) applyWarp(currentCorners);
 }
@@ -1108,6 +1189,15 @@ function _loadTexture(fileName) {
   return _textureLoader.load(`assets/planet-textures/${fileName}`);
 }
 
+// Half the canvas size in CSS px, shared by reference with every planet
+// material's uHalfViewport uniform (PLANET_VERT needs it to convert a screen
+// -space radius into NDC). Mutated in place by _syncHalfViewport() so all of
+// those materials pick the new size up without being walked individually.
+const _halfViewport = new THREE.Vector2(window.innerWidth / 2, window.innerHeight / 2);
+function _syncHalfViewport() {
+  _halfViewport.set(window.innerWidth / 2, window.innerHeight / 2);
+}
+
 function _buildSunSprite(body) {
   const group = new THREE.Group();
 
@@ -1146,22 +1236,6 @@ function _buildMoonMesh(body) {
   return mesh;
 }
 
-function _buildSaturnRing() {
-  // Parented to Saturn's billboard disc (see _buildPlanetBillboard), which
-  // inherits its scale.set(sizePx, sizePx, 1) — a PlaneGeometry(1,1) spans
-  // -0.5..+0.5 of that scale (radius ~0.5 "dot units"), so these raw radii
-  // are chosen to land just outside that after inheriting the same scale:
-  // ~0.55x-0.9x sizePx.
-  const geo = new THREE.RingGeometry(0.55, 0.9, 48);
-  const mat = new THREE.MeshBasicMaterial({
-    map: _loadTexture('saturn_ring.webp'), transparent: true, side: THREE.DoubleSide,
-  });
-  const ring = new THREE.Mesh(geo, mat);
-  ring.scale.y = 0.45;   // flat ring geometry, squished for a "tilted" look
-  ring.position.z = -0.02;
-  return ring;
-}
-
 // Real per-body equirectangular textures (generated by the same pipeline as
 // sun_disc.webp/moon.webp — see tools/generate_cast_star_catalog.py's siblings).
 //
@@ -1186,22 +1260,27 @@ const PLANET_TEXTURES = {
   neptune: 'neptune.webp',
 };
 
-// Sphere IMPOSTOR, not an actual 3D mesh sphere: a camera-facing billboard
-// quad whose fragment shader reconstructs a unit-sphere normal per pixel and
-// samples the equirectangular texture through it (see PLANET_FRAG). This is
-// the same technique the phone app uses (SkyShaders.kt's PLANET_SPHERE_VERTEX
-// / PLANET_SPHERE_FRAGMENT) and for the same reason: an actual mesh sphere is
-// subject to real perspective/fisheye distortion and projects as an ellipse
-// when off-axis, while a billboard re-oriented to face the eye every tick
-// (see the lookAt() call in updatePlanetPositions(), same trick already used
-// for the Moon) always renders as a perfect circle regardless of camera
-// angle. Unlike the phone, this receiver has no per-body pole/sub-Earth
-// ephemeris to drive real orientation — see PLANET_FRAG's fixed-face note.
+// Sphere IMPOSTOR, not an actual 3D mesh sphere: a screen-space billboard
+// whose fragment shader reconstructs a unit-sphere normal per pixel and
+// samples the equirectangular texture through it. Same technique as the phone
+// app (SkyShaders.kt's PLANET_SPHERE_VERTEX / PLANET_SPHERE_FRAGMENT). See
+// PLANET_VERT's comment for why the quad has to be laid out in screen space
+// rather than world space — that, not the texturing, is what keeps these
+// round under applyAim()'s homography.
+//
+// Saturn's ring is drawn by the same fragment shader on a widened quad (the
+// HAS_RING define) rather than as its own child mesh: a child mesh would be
+// back to having a world-space extent, and would come out sheared and
+// detached from the globe it's supposed to be wrapped around.
+const SATURN_QUAD_SCALE = 2.0;   // room for RING_OUTER (1.8 globe radii) plus margin
+
 function _buildPlanetBillboard(body, textureFile) {
   const group = new THREE.Group();
 
   // Faint additive glow behind the disc, same treatment as the Sun's halo —
-  // keeps the planet easy to spot before the eye resolves the tiny disc.
+  // keeps the planet easy to spot before the eye resolves the tiny disc. Left
+  // as a plain Sprite: the homography distorts it too, but it's a soft radial
+  // gradient with no shape to lose.
   const halo = new THREE.Sprite(new THREE.SpriteMaterial({
     map: _dotTexture(body.color), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
   }));
@@ -1209,15 +1288,28 @@ function _buildPlanetBillboard(body, textureFile) {
   halo.position.z = -0.05;
   group.add(halo);
 
-  const geo = new THREE.PlaneGeometry(1, 1);
+  const hasRing = body.name === 'saturn';
+  const uniforms = {
+    uMap:          { value: _loadTexture(textureFile) },
+    uHalfViewport: { value: _halfViewport },
+    // The quad used to be scale.set(sizePx, sizePx, 1) on a PlaneGeometry(1,1),
+    // i.e. a half-extent of sizePx/2 world units — that's the globe's radius.
+    uWorldRadius:  { value: body.sizePx * 0.5 },
+    uQuadScale:    { value: hasRing ? SATURN_QUAD_SCALE : 1.0 },
+  };
+  if (hasRing) uniforms.uRingMap = { value: _loadTexture('saturn_ring.webp') };
+
   const mat = new THREE.ShaderMaterial({
-    uniforms: { uMap: { value: _loadTexture(textureFile) } },
+    uniforms,
+    defines: hasRing ? { HAS_RING: '' } : {},
     vertexShader: PLANET_VERT, fragmentShader: PLANET_FRAG,
     transparent: true, depthWrite: false,
   });
-  const disc = new THREE.Mesh(geo, mat);
-  disc.scale.set(body.sizePx, body.sizePx, 1);
-  if (body.name === 'saturn') disc.add(_buildSaturnRing());
+  const disc = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
+  // The on-screen size comes from uWorldRadius in the vertex shader, so the
+  // mesh's own scale stays 1 and its CPU-side bounding sphere no longer says
+  // anything about where it lands — cull it by hand rather than wrongly.
+  disc.frustumCulled = false;
   group.add(disc);
 
   return group;
@@ -1280,18 +1372,13 @@ function updatePlanetPositions() {
     // Sprites (Sun, and the flat-dot fallback for any untextured body)
     // billboard to face the camera automatically as part of how Three.js
     // renders them — that's baked into the old orthographic-camera design
-    // too, so it kept working unchanged. The Moon (a Mesh, for its phase
-    // shader) and the sphere-impostor planet billboards (Groups containing a
-    // Mesh, for PLANET_FRAG) don't get that automatic treatment, so unlike a
-    // Sprite they do NOT auto-face the eye — with the eye fixed at the
-    // origin, lookAt(0,0,0) re-orients them to face inward every tick as they
-    // move across the sphere. (A Group's rotation doesn't perturb its child
-    // Sprites' own billboarding — Three's sprite shader derives facing from
-    // the camera, not the object's rotation — so this is safe for the
-    // planets' halo-plus-disc Groups too.)
-    if (body.name === 'moon' || PLANET_TEXTURES[body.name]) {
-      obj.lookAt(0, 0, 0);
-    }
+    // too, so it kept working unchanged. The Moon is the one Mesh (needed for
+    // its phase shader, which a Sprite's fixed quad-facing-camera trick can't
+    // drive), so unlike a Sprite it does NOT auto-face the eye — with the eye
+    // fixed at the origin, lookAt(0,0,0) re-orients it to face inward every
+    // tick as it moves across the sphere. The textured planets need no
+    // orientation at all: PLANET_VERT lays their quad out in screen space
+    // from their centre alone, so their mesh rotation is never read.
     if (body.name === 'moon') {
       // Moon is a Mesh with a phase shader (see MOON_FRAG) — its uniforms
       // need refreshing too, not just its position/orientation. Phase changes
