@@ -586,6 +586,13 @@ const SCREEN_QUAD_VERT = `
   uniform vec2  uHalfViewport;  // (canvas width, height) / 2, in CSS px
   uniform float uWorldRadius;   // body radius in world units at the sky sphere
   uniform float uQuadScale;     // 1.0 normally; >1 to leave room for a glow/ring
+  // In-plane rotation, radians — 0.0 for the Sun/planets (never set, so it
+  // stays at WebGL's default-zero for those materials). Only satellite
+  // glyphs set this, to the same per-object jitter the phone app applies —
+  // see _satelliteGlyphJitterDeg(). Rotating here (a rigid 2D rotation of the
+  // whole quad, in isotropic screen-pixel space) can't reintroduce the
+  // anisotropic shear this vertex shader exists to avoid.
+  uniform float uGlyphRotationRad;
   varying vec2 vUv;
 
   void main() {
@@ -622,7 +629,11 @@ const SCREEN_QUAD_VERT = `
     // body keeps its apparent size and only its distortion is thrown away.
     float radiusPx = sqrt(max(length(stepA) * length(stepB), 1.0e-6)) * uQuadScale;
 
-    vec2 offset = (uv * 2.0 - 1.0) * radiusPx / uHalfViewport;
+    vec2 cornerPx = (uv * 2.0 - 1.0) * radiusPx;
+    float cosR = cos(uGlyphRotationRad);
+    float sinR = sin(uGlyphRotationRad);
+    vec2 rotatedPx = vec2(cornerPx.x * cosR - cornerPx.y * sinR, cornerPx.x * sinR + cornerPx.y * cosR);
+    vec2 offset = rotatedPx / uHalfViewport;
     // z = 0 (mid-range, always inside the depth clip) matches what applyAim()
     // puts in the projection matrix — nothing here writes depth.
     gl_Position = vec4((centreNdc + offset) * c.w, 0.0, c.w);
@@ -1485,30 +1496,41 @@ function updatePlanetPositions() {
 // Satellite glyph textures and pooled sprites — built once and reused, rather
 // than allocating a canvas/texture/material per satellite on every 5s
 // propagate tick (the Chromecast's GPU/memory budget is tight; churn here
-// caused visible jank). Same accent colour (#7de8e8) and shapes as the phone
-// app's ObjectGlyphs.kt (drawSatelliteGlyph / isIssSatellite's ring glyph),
-// redrawn with Canvas 2D instead of Compose so both apps read as the same icon.
+// caused visible jank). Same accent colour (#7de8e8), shapes, AND internal
+// proportions as the phone app's ObjectGlyphs.kt (drawSatelliteGlyph /
+// isIssSatellite's ring glyph), redrawn with Canvas 2D instead of Compose.
+//
+// GLYPH_REF_SIZE_PX stands in for the phone's "sizePx" parameter — the value
+// every ratio below (half/panel/stroke/radius/ringWidth) is expressed against
+// on the phone. The phone passes the SAME sizePx to both the generic and ISS
+// glyphs, so using one shared reference here preserves their size *relative
+// to each other*, exactly as on the phone; the actual on-screen footprint is
+// controlled separately by SAT_WORLD_RADIUS in the vertex shader, not by
+// this canvas's pixel resolution — this constant only fixes the proportions
+// baked into the texture.
 const SAT_GLYPH_COLOR = '#7de8e8';
+const GLYPH_REF_SIZE_PX = 36;
 let _satGlyphTexture = null;
 let _issGlyphTexture = null;
 let _satSpritePool = [];
 
 // Generic satellite glyph: horizontal wingspan + vertical body + two solar
-// panels, matching drawSatelliteGlyph()'s non-ISS branch.
+// panels, matching drawSatelliteGlyph()'s non-ISS branch — same ratios
+// (half=0.5, panel=0.26, stroke=max(0.13, 1.2px)) against GLYPH_REF_SIZE_PX.
 function _getSatGlyphTexture() {
   if (_satGlyphTexture) return _satGlyphTexture;
   const cv = document.createElement('canvas');
   cv.width = cv.height = 64;
   const ctx = cv.getContext('2d');
   const cx = 32, cy = 32;
-  const half = 16, panel = 8, stroke = 3;
+  const sizePx = GLYPH_REF_SIZE_PX;
+  const half = sizePx * 0.5;
+  const panel = sizePx * 0.26;
+  const stroke = Math.max(sizePx * 0.13, 1.2);
 
-  // Soft glow aura
-  const glow = ctx.createRadialGradient(cx, cy, 1, cx, cy, half * 1.4);
-  glow.addColorStop(0, 'rgba(125,232,232,0.30)');
-  glow.addColorStop(1, 'rgba(125,232,232,0)');
-  ctx.fillStyle = glow;
-  ctx.beginPath(); ctx.arc(cx, cy, half * 1.4, 0, Math.PI * 2); ctx.fill();
+  // Soft glow aura — flat-alpha circle, same as the phone (not a gradient).
+  ctx.fillStyle = 'rgba(125,232,232,0.12)';
+  ctx.beginPath(); ctx.arc(cx, cy, sizePx * 0.7, 0, Math.PI * 2); ctx.fill();
 
   ctx.strokeStyle = SAT_GLYPH_COLOR;
   ctx.lineCap = 'round';
@@ -1539,19 +1561,21 @@ function _getSatGlyphTexture() {
 }
 
 // ISS glyph: ring + crosshair, matching drawSatelliteGlyph()'s isIss branch —
-// kept visually distinct since the ISS is the one satellite most people look for.
+// same ratios (radius=0.45, ringWidth=max(0.14, 1.4px)) against the SAME
+// GLYPH_REF_SIZE_PX the generic glyph uses, kept visually distinct since the
+// ISS is the one satellite most people look for.
 function _getIssGlyphTexture() {
   if (_issGlyphTexture) return _issGlyphTexture;
   const cv = document.createElement('canvas');
   cv.width = cv.height = 64;
   const ctx = cv.getContext('2d');
   const cx = 32, cy = 32;
-  const radius = 22, ringWidth = 4;
+  const sizePx = GLYPH_REF_SIZE_PX;
+  const radius = sizePx * 0.45;
+  const ringWidth = Math.max(sizePx * 0.14, 1.4);
 
-  const glow = ctx.createRadialGradient(cx, cy, 1, cx, cy, radius * 1.8);
-  glow.addColorStop(0, 'rgba(125,232,232,0.15)');
-  glow.addColorStop(1, 'rgba(125,232,232,0)');
-  ctx.fillStyle = glow;
+  // Glow aura — flat-alpha circle, same as the phone.
+  ctx.fillStyle = 'rgba(125,232,232,0.15)';
   ctx.beginPath(); ctx.arc(cx, cy, radius * 1.8, 0, Math.PI * 2); ctx.fill();
 
   ctx.strokeStyle = SAT_GLYPH_COLOR;
@@ -1572,6 +1596,31 @@ function _getIssGlyphTexture() {
 // receiver's TLE records don't carry the NORAD catalog id, only OBJECT_NAME.
 function _isIssName(name) {
   return /ISS|ZARYA|International Space Station/i.test(name || '');
+}
+
+// Exact port of java.lang.String.hashCode() (32-bit, signed overflow wraps) —
+// needed so _satelliteGlyphJitterDeg can reproduce the phone's
+// satelliteGlyphJitterDeg(objectId) formula bit-for-bit. The receiver has no
+// equivalent of the phone's NORAD-derived "sat_25544" object id (its TLE
+// records only carry OBJECT_NAME — see fetchTLEs()), so this hashes the name
+// instead: a different input than the phone hashes, so a given satellite's
+// jitter angle won't numerically match the phone's for that same satellite —
+// but the ALGORITHM (a deterministic, evenly-distributed ±7° hash-based tilt
+// per object, so generic satellite glyphs don't all share one orientation)
+// is identical, which is what's actually observable on screen.
+function _javaHashCode(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = (Math.imul(31, hash) + str.charCodeAt(i)) | 0;
+  }
+  return hash;
+}
+
+// Matches ObjectGlyphs.kt's satelliteGlyphJitterDeg() exactly (same formula,
+// see _javaHashCode's doc comment for the one substitution: name vs id).
+function _satelliteGlyphJitterDeg(name) {
+  const normalized = ((_javaHashCode(name) & 0x7fffffff) % 1000) / 999.0;
+  return (normalized - 0.5) * 14.0;
 }
 
 async function fetchTLEs() {
@@ -1654,10 +1703,11 @@ function _updateSatSprites(sats) {
   while (_satSpritePool.length < sats.length) {
     const mat = new THREE.ShaderMaterial({
       uniforms: {
-        uMap:          { value: _getSatGlyphTexture() },
-        uHalfViewport: { value: _halfViewport },
-        uWorldRadius:  { value: SAT_WORLD_RADIUS },
-        uQuadScale:    { value: 1.0 },
+        uMap:              { value: _getSatGlyphTexture() },
+        uHalfViewport:     { value: _halfViewport },
+        uWorldRadius:      { value: SAT_WORLD_RADIUS },
+        uQuadScale:        { value: 1.0 },
+        uGlyphRotationRad: { value: 0 },
       },
       vertexShader: SCREEN_QUAD_VERT, fragmentShader: SAT_FRAG,
       transparent: true, depthWrite: false,
@@ -1679,6 +1729,12 @@ function _updateSatSprites(sats) {
       const wantTex = wantIss ? _getIssGlyphTexture() : _getSatGlyphTexture();
       const uMap = billboard.material.uniforms.uMap;
       if (uMap.value !== wantTex) uMap.value = wantTex;
+      // Matches the phone: the ISS glyph gets no jitter at all (its
+      // isIssSatellite() branch only ever rotates by -rollDeg, which is
+      // always 0 here since there's no physical device to tilt) — only the
+      // generic glyph is jittered, per-object, via satelliteGlyphJitterDeg().
+      const jitterDeg = wantIss ? 0 : _satelliteGlyphJitterDeg(sats[i].name);
+      billboard.material.uniforms.uGlyphRotationRad.value = jitterDeg * (Math.PI / 180);
       billboard.visible = true;
     } else {
       billboard.visible = false;
