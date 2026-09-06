@@ -515,12 +515,48 @@ const MOON_FRAG = `
   }
 `;
 
+// Set while the WebGL context is lost (see the listeners below) — animate()
+// checks this so it doesn't keep calling renderer.render() against a dead
+// context every frame, which is a guaranteed console-spamming no-op at best.
+let _glContextLost = false;
+
 function initScene() {
   renderer = new THREE.WebGLRenderer({ canvas: canvasEl, antialias: true });
   renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setClearColor(0x000000, 1);
   resizeSelectionCanvas();
+
+  // A lost WebGL context is the browser's way of saying the GPU driver killed this
+  // context — from memory pressure, a driver reset, or (on a Chromecast's weak/
+  // software-fallback GPU, already noted elsewhere in this file) simply running out
+  // of budget for a scene this size held open indefinitely. Without a handler for
+  // it the canvas just goes solid black (the browser's default) and stays that way
+  // until *something* reloads the page — nothing here was listening for the event
+  // at all, so a receiver that dropped its context had no path back. Reported
+  // symptom this targets: the whole projected image intermittently going black for
+  // a moment and then recovering, in both CALIBRATING and RUNNING alike (the WebGL
+  // context is live continuously in both, unlike anything gated by appState).
+  //
+  // preventDefault() on 'webglcontextlost' is required by the spec for the context
+  // to ever be restored at all — without it the browser treats the loss as
+  // permanent. Reloading on restore (rather than trying to hand-rebuild every
+  // texture/buffer/program Three.js had uploaded) is deliberate: this receiver
+  // already persists the last-applied setup (see loadSetup/saveSetup) specifically
+  // so it can resume unattended after a full Chromecast reboot, so a page reload
+  // here resumes the sky exactly the same way, with far less surface area for a
+  // half-rebuilt scene to get wrong.
+  canvasEl.addEventListener('webglcontextlost', e => {
+    e.preventDefault();
+    _glContextLost = true;
+    console.error('[Receiver] WebGL context lost');
+    sendState({ event: 'WEBGL_CONTEXT_LOST' });
+  });
+  canvasEl.addEventListener('webglcontextrestored', () => {
+    console.warn('[Receiver] WebGL context restored — reloading to rebuild the scene');
+    sendState({ event: 'WEBGL_CONTEXT_RESTORED' });
+    location.reload();
+  });
 
   scene      = new THREE.Scene();
   sceneGroup = new THREE.Group();
@@ -633,12 +669,12 @@ function initScene() {
   // for Sun/Saturn that's the "primary" sprite, with the glow halo / ring as a
   // child so it rides along automatically without separate position tracking.
   //
-  // Mercury/Venus/Mars/Jupiter/Uranus/Neptune stay flat colour dots rather than
-  // their own equirectangular surface textures: at ~6-14px on screen a squished
-  // rectangular photo would read as noise, not a recognisable planet, and (e.g.
-  // Venus) some of those textures are false-colour radar maps anyway — no more
-  // "accurate" than a hand-picked colour. The Sun (50px) and Moon (40px, with
-  // real phase shape) are where real texture detail is actually visible.
+  // Mercury/Venus/Mars/Jupiter/Saturn/Uranus/Neptune each get their own
+  // equirectangular surface texture mapped onto a small sphere (see
+  // PLANET_TEXTURES/_buildPlanetSphere below) — a sphere wraps the texture
+  // correctly at any size, unlike a flat sprite quad which would squash it.
+  // The Sun (50px) and Moon (40px, with real phase shape) keep their existing
+  // bespoke builders.
   planetGroup = new THREE.Group();
   for (const body of Planets.compute(skyNow())) {
     let obj;
@@ -646,12 +682,13 @@ function initScene() {
       obj = _buildSunSprite(body);
     } else if (body.name === 'moon') {
       obj = _buildMoonMesh(body);
+    } else if (PLANET_TEXTURES[body.name]) {
+      obj = _buildPlanetSphere(body, PLANET_TEXTURES[body.name]);
     } else {
       obj = new THREE.Sprite(new THREE.SpriteMaterial({
         map: _dotTexture(body.color), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
       }));
       obj.scale.set(body.sizePx, body.sizePx, 1);
-      if (body.name === 'saturn') obj.add(_buildSaturnRing());
     }
     // Position is fully overwritten every tick by updatePlanetPositions() —
     // see PLANET_RADIUS there for how depth-ordering vs. the star field works
@@ -996,10 +1033,10 @@ function _buildMoonMesh(body) {
 }
 
 function _buildSaturnRing() {
-  // Parented to the Saturn sprite (see the caller), which inherits its
-  // scale.set(sizePx, sizePx, 1) — a Sprite quad spans -0.5..+0.5 of that
-  // scale (radius ~0.5 "dot units"), so these raw radii are chosen to land
-  // just outside that after inheriting the same scale: ~0.55x-0.9x sizePx.
+  // Parented to the Saturn sphere (see _buildPlanetSphere), which inherits its
+  // scale.set(sizePx, sizePx, sizePx) — the sphere geometry has radius 0.5 in
+  // the same units, so these raw radii are chosen to land just outside that
+  // after inheriting the same scale: ~0.55x-0.9x sizePx.
   const geo = new THREE.RingGeometry(0.55, 0.9, 48);
   const mat = new THREE.MeshBasicMaterial({
     map: _loadTexture('saturn_ring.webp'), transparent: true, side: THREE.DoubleSide,
@@ -1008,6 +1045,55 @@ function _buildSaturnRing() {
   ring.scale.y = 0.45;   // flat ring geometry, squished for a "tilted" look
   ring.position.z = -0.02;
   return ring;
+}
+
+// Real per-body equirectangular textures (generated by the same pipeline as
+// sun_disc.webp/moon.webp — see tools/generate_cast_star_catalog.py's siblings).
+//
+// Downscaled to 128x64: these bodies render at sizePx 6-14px on screen (see
+// planets.js's SIZE_PX), so the original 1024x512 sources — ~2MB each once
+// decoded to RGBA, ~18MB total across all seven plus mipmaps — bought zero
+// visible detail (nothing above a handful of pixels can show surface
+// features) while pushing GPU texture memory well beyond what a Chromecast's
+// GPU comfortably holds alongside the star field's own buffers. That
+// contention is the likely cause of a periodic full-screen flicker reported
+// on-device (both while calibrating and while running, since these spheres
+// render continuously regardless of app state) that never reproduced in a
+// desktop browser. 128x64 is still generous headroom over anything these
+// sizes need at up to ~3x device pixel ratio.
+const PLANET_TEXTURES = {
+  mercury: 'mercury.webp',
+  venus:   'venus.webp',
+  mars:    'mars.webp',
+  jupiter: 'jupiter.webp',
+  saturn:  'saturn.webp',
+  uranus:  'uranus.webp',
+  neptune: 'neptune.webp',
+};
+
+// A sphere (not a flat sprite) so the equirectangular texture wraps correctly
+// at any viewing angle instead of reading as a squished rectangle. Radius 0.5
+// matches the "dot units" _buildSaturnRing()'s ring geometry is sized against.
+function _buildPlanetSphere(body, textureFile) {
+  const group = new THREE.Group();
+
+  // Faint additive glow behind the sphere, same treatment as the Sun's halo —
+  // keeps the planet easy to spot before the eye resolves the tiny disc.
+  const halo = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: _dotTexture(body.color), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  }));
+  halo.scale.set(body.sizePx * 1.8, body.sizePx * 1.8, 1);
+  halo.position.z = -0.05;
+  group.add(halo);
+
+  const geo = new THREE.SphereGeometry(0.5, 24, 16);
+  const mat = new THREE.MeshBasicMaterial({ map: _loadTexture(textureFile), transparent: true, depthWrite: false });
+  const sphere = new THREE.Mesh(geo, mat);
+  sphere.scale.set(body.sizePx, body.sizePx, body.sizePx);
+  if (body.name === 'saturn') sphere.add(_buildSaturnRing());
+  group.add(sphere);
+
+  return group;
 }
 
 // ── Layer visibility ────────────────────────────────────────────────────────
@@ -1085,27 +1171,96 @@ function updatePlanetPositions() {
   }
 }
 
-// Satellite dot texture and pooled sprites — built once and reused, rather than
-// allocating a canvas/texture/material per satellite on every 5s propagate tick
-// (the Chromecast's GPU/memory budget is tight; churn here caused visible jank).
-let _satDotTexture = null;
+// Satellite glyph textures and pooled sprites — built once and reused, rather
+// than allocating a canvas/texture/material per satellite on every 5s
+// propagate tick (the Chromecast's GPU/memory budget is tight; churn here
+// caused visible jank). Same accent colour (#7de8e8) and shapes as the phone
+// app's ObjectGlyphs.kt (drawSatelliteGlyph / isIssSatellite's ring glyph),
+// redrawn with Canvas 2D instead of Compose so both apps read as the same icon.
+const SAT_GLYPH_COLOR = '#7de8e8';
+let _satGlyphTexture = null;
+let _issGlyphTexture = null;
 let _satSpritePool = [];
 
-function _getSatDotTexture() {
-  if (_satDotTexture) return _satDotTexture;
+// Generic satellite glyph: horizontal wingspan + vertical body + two solar
+// panels, matching drawSatelliteGlyph()'s non-ISS branch.
+function _getSatGlyphTexture() {
+  if (_satGlyphTexture) return _satGlyphTexture;
   const cv = document.createElement('canvas');
-  cv.width = cv.height = 32;
+  cv.width = cv.height = 64;
   const ctx = cv.getContext('2d');
-  const g   = ctx.createRadialGradient(16,16,1,16,16,14);
-  g.addColorStop(0,   'rgba(125,232,232,0.95)');
-  g.addColorStop(0.5, 'rgba(125,232,232,0.40)');
-  g.addColorStop(1,   'rgba(125,232,232,0)');
-  ctx.fillStyle = g;
-  ctx.beginPath(); ctx.arc(16,16,14,0,Math.PI*2); ctx.fill();
-  ctx.fillStyle = '#fff';
-  ctx.beginPath(); ctx.arc(16,16,3,0,Math.PI*2);  ctx.fill();
-  _satDotTexture = new THREE.CanvasTexture(cv);
-  return _satDotTexture;
+  const cx = 32, cy = 32;
+  const half = 16, panel = 8, stroke = 3;
+
+  // Soft glow aura
+  const glow = ctx.createRadialGradient(cx, cy, 1, cx, cy, half * 1.4);
+  glow.addColorStop(0, 'rgba(125,232,232,0.30)');
+  glow.addColorStop(1, 'rgba(125,232,232,0)');
+  ctx.fillStyle = glow;
+  ctx.beginPath(); ctx.arc(cx, cy, half * 1.4, 0, Math.PI * 2); ctx.fill();
+
+  ctx.strokeStyle = SAT_GLYPH_COLOR;
+  ctx.lineCap = 'round';
+  ctx.lineWidth = stroke;
+
+  // Wing span (horizontal)
+  ctx.beginPath(); ctx.moveTo(cx - half, cy); ctx.lineTo(cx + half, cy); ctx.stroke();
+  // Body (vertical)
+  ctx.beginPath(); ctx.moveTo(cx, cy - half * 0.55); ctx.lineTo(cx, cy + half * 0.55); ctx.stroke();
+
+  // Solar panels — filled rect with subtle border, one either side
+  for (const side of [-1, 1]) {
+    const px = side < 0 ? cx - half - panel : cx + half;
+    const py = cy - panel * 0.9;
+    ctx.fillStyle = 'rgba(125,232,232,0.70)';
+    ctx.fillRect(px, py, panel, panel * 1.8);
+    ctx.strokeStyle = 'rgba(125,232,232,0.90)';
+    ctx.lineWidth = stroke * 0.5;
+    ctx.strokeRect(px, py, panel, panel * 1.8);
+  }
+
+  // Central body dot
+  ctx.fillStyle = SAT_GLYPH_COLOR;
+  ctx.beginPath(); ctx.arc(cx, cy, stroke * 1.1, 0, Math.PI * 2); ctx.fill();
+
+  _satGlyphTexture = new THREE.CanvasTexture(cv);
+  return _satGlyphTexture;
+}
+
+// ISS glyph: ring + crosshair, matching drawSatelliteGlyph()'s isIss branch —
+// kept visually distinct since the ISS is the one satellite most people look for.
+function _getIssGlyphTexture() {
+  if (_issGlyphTexture) return _issGlyphTexture;
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = 64;
+  const ctx = cv.getContext('2d');
+  const cx = 32, cy = 32;
+  const radius = 22, ringWidth = 4;
+
+  const glow = ctx.createRadialGradient(cx, cy, 1, cx, cy, radius * 1.8);
+  glow.addColorStop(0, 'rgba(125,232,232,0.15)');
+  glow.addColorStop(1, 'rgba(125,232,232,0)');
+  ctx.fillStyle = glow;
+  ctx.beginPath(); ctx.arc(cx, cy, radius * 1.8, 0, Math.PI * 2); ctx.fill();
+
+  ctx.strokeStyle = SAT_GLYPH_COLOR;
+  ctx.lineWidth = ringWidth;
+  ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.arc(cx, cy, radius, 0, Math.PI * 2); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx - radius * 0.6, cy); ctx.lineTo(cx + radius * 0.6, cy); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx, cy - radius * 0.45); ctx.lineTo(cx, cy + radius * 0.45); ctx.stroke();
+
+  ctx.fillStyle = 'rgba(125,232,232,0.45)';
+  ctx.beginPath(); ctx.arc(cx, cy, radius * 0.45, 0, Math.PI * 2); ctx.fill();
+
+  _issGlyphTexture = new THREE.CanvasTexture(cv);
+  return _issGlyphTexture;
+}
+
+// Matches ObjectGlyphs.kt's isIssSatellite(): checked by name since the
+// receiver's TLE records don't carry the NORAD catalog id, only OBJECT_NAME.
+function _isIssName(name) {
+  return /ISS|ZARYA|International Space Station/i.test(name || '');
 }
 
 async function fetchTLEs() {
@@ -1153,7 +1308,7 @@ function propagateSatellites() {
     height:    0,
   };
   const visible = [];
-  for (const { satrec } of sky.tleRecords) {
+  for (const { name, satrec } of sky.tleRecords) {
     try {
       const pv = satellite.propagate(satrec, now);
       if (!pv.position) continue;
@@ -1164,7 +1319,7 @@ function propagateSatellites() {
       // Apparent (refracted) altitude — see astronomy.js's refractionDeg() doc
       // comment: keeps a tracked satellite's dot aligned with the SELECT ring,
       // which mirrors the phone's already-refracted azimuthDeg/altitudeDeg.
-      visible.push({ alt: Astro.apparentFromTrueDeg(altDeg), az: look.azimuth * (180 / Math.PI) });
+      visible.push({ alt: Astro.apparentFromTrueDeg(altDeg), az: look.azimuth * (180 / Math.PI), name });
     } catch (_) {}
   }
   _updateSatSprites(visible);
@@ -1173,13 +1328,11 @@ function propagateSatellites() {
 // Time: O(n) | Space: O(max concurrent visible satellites) — pool grows to the
 // high-water mark and is never shrunk (a handful of sprites is negligible).
 function _updateSatSprites(sats) {
-  const texture = _getSatDotTexture();
-
   while (_satSpritePool.length < sats.length) {
     const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
-      map: texture, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      map: _getSatGlyphTexture(), transparent: true, depthWrite: false,
     }));
-    sprite.scale.set(16, 16, 1);
+    sprite.scale.set(20, 20, 1);
     _satSpritePool.push(sprite);
     satGroup.add(sprite);
   }
@@ -1191,6 +1344,12 @@ function _updateSatSprites(sats) {
       // satellites in front of both planets and stars.
       const { x, y, z } = Astro.altAzToXYZ(sats[i].alt, sats[i].az);
       sprite.position.set(x, y, z).multiplyScalar(SAT_RADIUS);
+      const wantIss = _isIssName(sats[i].name);
+      const wantTex = wantIss ? _getIssGlyphTexture() : _getSatGlyphTexture();
+      if (sprite.material.map !== wantTex) {
+        sprite.material.map = wantTex;
+        sprite.material.needsUpdate = true;
+      }
       sprite.visible = true;
     } else {
       sprite.visible = false;
@@ -1206,6 +1365,7 @@ const _clockStart = performance.now();
 
 function animate() {
   requestAnimationFrame(animate);
+  if (_glContextLost) return;   // see the 'webglcontextlost' listener in initScene()
   if (Date.now() - _lastStarMs > CONFIG.STAR_UPDATE_MS) {
     updateStarPositions();
     updatePlanetPositions();
