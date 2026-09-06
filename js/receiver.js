@@ -124,6 +124,64 @@ function isValidAim(aim) {
   );
 }
 
+// ─── Clock: the phone is the time authority ───────────────────────────────────
+//
+// Every sky position here is a function of sidereal time, so the receiver's
+// clock IS its pointing accuracy: one second of error rotates the whole sky by
+// 15 arcseconds, a minute by 0.25°. That is small in the middle of a projected
+// frame and obvious at its edges, where a keystoned homography packs far more
+// pixels into a degree — and it shows up as the phone's SELECT ring sitting off
+// the object it is marking, since the ring's az/alt was computed on the phone,
+// against the phone's clock.
+//
+// A Cast device's own clock is the weak link: it syncs over NTP at boot and
+// periodically after, and this receiver restores its setup from localStorage
+// and starts drawing immediately — i.e. at exactly the moment the clock is
+// least likely to have synced yet. Observed in the wild as a sky that was
+// consistently offset and then, with nothing changed at either end, jumped
+// into place.
+//
+// So: take the time from the phone (GPS/network-backed) whenever it speaks —
+// every message carries utcMillis, so this costs no extra traffic and no
+// polling — and then carry it forward on performance.now(), which is monotonic
+// and unaffected by the system clock. Two consequences that matter:
+//
+//   * The receiver keeps correct time indefinitely after the phone disconnects
+//     (it must — it is designed to outlive the sender), drifting only with the
+//     device's own crystal: parts-per-million, seconds per month.
+//   * A later NTP correction on the TV can't yank the sky sideways mid-session,
+//     because nothing downstream of the sync reads the system clock again.
+//
+// One-way Cast latency (tens of ms on a LAN) is ignored deliberately: at
+// 15"/sec it is worth well under an arcsecond, far below every other error in
+// this file. The offset is NOT persisted — a stale one, measured while the TV
+// clock was wrong, would keep re-applying that error after the TV had fixed
+// itself, which is worse than the untouched fallback below.
+let _syncPhoneMs = null;   // phone's UTC at the moment of the last sync
+let _syncPerfMs  = 0;      // performance.now() at that same moment
+
+function syncClock(utcMillis) {
+  // Sanity-bound it: a garbled value would silently rotate the entire sky.
+  // 2020..2100 in Unix ms — anything outside is not a clock reading.
+  if (!Number.isFinite(utcMillis) || utcMillis < 1577836800000 || utcMillis > 4102444800000) return;
+  const firstSync = _syncPhoneMs === null;
+  _syncPhoneMs = utcMillis;
+  _syncPerfMs  = performance.now();
+  if (firstSync) {
+    // Logged once, not per message: the first sync is the interesting one (it
+    // reports how far off this device's own clock was), and the receiver's
+    // console is only reachable over remote debugging anyway.
+    console.log(`[Clock] Synced to phone; device clock was off by ${((Date.now() - utcMillis) / 1000).toFixed(1)}s`);
+  }
+}
+
+// The time every sky computation must use. Falls back to the device clock
+// until a phone has spoken once — the pre-sync behaviour, unchanged.
+function skyNow() {
+  if (_syncPhoneMs === null) return new Date();
+  return new Date(_syncPhoneMs + (performance.now() - _syncPerfMs));
+}
+
 function saveSetup() {
   // Nothing meaningful to resume yet — e.g. a LAYERS toggle arrived before the
   // first SETUP. Don't overwrite (or create) a persisted entry with it.
@@ -582,7 +640,7 @@ function initScene() {
   // "accurate" than a hand-picked colour. The Sun (50px) and Moon (40px, with
   // real phase shape) are where real texture detail is actually visible.
   planetGroup = new THREE.Group();
-  for (const body of Planets.compute(new Date())) {
+  for (const body of Planets.compute(skyNow())) {
     let obj;
     if (body.name === 'sun') {
       obj = _buildSunSprite(body);
@@ -774,7 +832,34 @@ const LABEL_FONT_SIZE_PX     = 28;
 const LABEL_MIN_FONT_SIZE_PX = 12;
 const LABEL_MAX_WIDTH_PX     = 320;
 
-let selection = { visible: false, azDeg: 0, altDeg: 0, name: '' };
+// azDeg/altDeg are the phone's last raw sample; raDeg/decDeg are that same
+// sample pinned to the celestial sphere, which is what actually gets drawn —
+// see trackedSelectionAltAz().
+let selection = { visible: false, azDeg: 0, altDeg: 0, raDeg: null, decDeg: null, name: '' };
+
+// Where to draw the marker *now*, as opposed to where the phone last said the
+// object was.
+//
+// The phone re-sends SELECT about once a second (ReadyView.kt), and the sky
+// turns continuously between those samples: 15" of rotation per second, but
+// held for a full second, against a star field this receiver redraws every
+// frame. Anchoring the sample to RA/Dec at the moment it arrives and
+// re-deriving az/alt per frame makes the ring ride the sky smoothly instead of
+// stepping once a second, and keeps it on its object indefinitely if the phone
+// goes quiet — which matters here, since the receiver is built to outlive the
+// sender (see syncClock()).
+//
+// This tracks the *sky's* rotation, not the object's own motion through it. For
+// everything except satellites that is the whole of the motion. A satellite
+// moves against the stars far faster than that, so between its 1 Hz updates
+// this is only an approximation of its track — but a much better one than
+// freezing, and each new SELECT re-anchors it.
+function trackedSelectionAltAz() {
+  if (selection.raDeg === null || sky.lat === null) {
+    return { az: selection.azDeg, alt: selection.altDeg };
+  }
+  return Astro.raDecToAltAz(selection.raDeg, selection.decDeg, sky.lat, sky.lng, skyNow());
+}
 
 function projectToScreen(azDeg, altDeg) {
   const { x, y, z } = Astro.altAzToXYZ(altDeg, azDeg);
@@ -794,7 +879,8 @@ function projectToScreen(azDeg, altDeg) {
 function drawSelectionOverlay() {
   selectionCtx.clearRect(0, 0, selectionCanvasEl.width, selectionCanvasEl.height);
   if (!selection.visible) return;
-  const pt = projectToScreen(selection.azDeg, selection.altDeg);
+  const { az, alt } = trackedSelectionAltAz();
+  const pt = projectToScreen(az, alt);
   if (!pt) return;
 
   selectionCtx.save();
@@ -947,7 +1033,7 @@ const SAT_RADIUS     = CONFIG.SKY_RADIUS * 0.998;
 
 function updateStarPositions() {
   if (sky.lat === null) return;
-  const now = new Date();
+  const now = skyNow();
   // Hoisted once per tick — see skyContext()/raDecToXYZInto()'s doc comments.
   // Latitude, sidereal time and the precession angles are all invariant
   // across every star in the loop below, unlike ra/dec.
@@ -965,7 +1051,7 @@ function updateStarPositions() {
 // all of their apparent movement is the same Earth-rotation term stars have).
 function updatePlanetPositions() {
   if (sky.lat === null) return;
-  const now = new Date();
+  const now = skyNow();
   for (const body of Planets.compute(now)) {
     const obj = planetSprites[body.name];
     if (!obj) continue;
@@ -1059,7 +1145,7 @@ async function fetchTLEs() {
 
 function propagateSatellites() {
   if (sky.lat === null || !sky.tleRecords.length || typeof satellite === 'undefined') return;
-  const now  = new Date();
+  const now  = skyNow();
   const gmst = satellite.gstime(now);
   const obs  = {
     latitude:  sky.lat  * (Math.PI / 180),
@@ -1220,6 +1306,12 @@ function handleMessage(_, raw) {
 }
 
 function dispatchMessage(msg) {
+  // Every message from the phone carries its clock — see syncClock()'s comment
+  // for why the phone's is the one to trust. Done here, before the switch, so
+  // any message type keeps the sky's time fresh, not just the sky-affecting
+  // ones. Absent/garbled values are ignored, so an older sender still works.
+  syncClock(msg.utcMillis);
+
   switch (msg.type) {
 
     // ── Live corner preview while user drags on phone ──────────────────────
@@ -1298,10 +1390,19 @@ function dispatchMessage(msg) {
         selection.visible = false;
         break;
       }
+      // Pin the sample to the rotating celestial sphere as it arrives, so the
+      // marker can follow the sky between updates — see trackedSelectionAltAz().
+      // Needs the observer's location; without it (no SETUP yet) the marker
+      // falls back to the raw sample, which is all there was before.
+      const anchor = sky.lat === null
+        ? null
+        : Astro.altAzToRaDec(msg.azimuthDeg, msg.altitudeDeg, sky.lat, sky.lng, skyNow());
       selection = {
         visible: true,
         azDeg: msg.azimuthDeg,
         altDeg: msg.altitudeDeg,
+        raDeg: anchor && anchor.ra,
+        decDeg: anchor && anchor.dec,
         name: msg.name || '',
       };
       break;

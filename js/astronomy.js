@@ -112,6 +112,22 @@ const Astro = (() => {
     return Math.min(90, trueAltDeg + refractionDeg(trueAltDeg));
   }
 
+  // The inverse direction needs a different formula: Sæmundsson's is a function
+  // of TRUE altitude, so it cannot simply be subtracted from an apparent one.
+  // Bennett (1982) is its standard counterpart, taking the APPARENT altitude —
+  // the pair agrees to ~0.1', far below anything visible here, and it is the
+  // same pairing the phone uses (AtmosphericRefraction.kt).
+  function refractionFromApparentDeg(apparentAltDeg) {
+    if (apparentAltDeg < REFRACTION_MIN_ALT_DEG) return 0;
+    const argDeg = apparentAltDeg + 7.31 / (apparentAltDeg + 4.4);
+    const arcmin = 1.0 / Math.tan(rad(argDeg));
+    return Math.max(0, arcmin / 60);
+  }
+
+  function trueFromApparentDeg(apparentAltDeg) {
+    return apparentAltDeg - refractionFromApparentDeg(apparentAltDeg);
+  }
+
   // ─── Diurnal (topocentric) parallax ───────────────────────────────────────
   //
   // Ephemerides — including planets.js's — give *geocentric* directions: where
@@ -142,8 +158,10 @@ const Astro = (() => {
   //
   // Standard spherical-trig formula (Meeus ch.13).
   //
-  // @param raDeg   Right Ascension (degrees, J2000)
-  // @param decDeg  Declination    (degrees, J2000)
+  // @param raDeg   Right Ascension (degrees, equinox OF DATE — this applies no
+  //                precession of its own; see precessionAngles() for callers
+  //                starting from a J2000 catalogue)
+  // @param decDeg  Declination    (degrees, equinox of date)
   // @param latDeg  Observer latitude   (degrees, north positive)
   // @param lngDeg  Observer longitude  (degrees, east positive)
   // @param date    JavaScript Date object (UTC)
@@ -183,6 +201,46 @@ const Astro = (() => {
       alt: apparentFromTrueDeg(topocentricAltDeg(deg(altR), distanceEarthRadii)),
       az:  deg(azR),
     };
+  }
+
+  // ─── Altitude / Azimuth → RA / Dec ───────────────────────────────────────
+  //
+  // The inverse of raDecToAltAz(), and the reason it exists here: the phone
+  // sends the SELECT ring's position as an (az, alt) sampled at one instant,
+  // about once a second. Held as-is, the ring would sit still between those
+  // samples while the sky it is drawn over keeps turning — a visible stair-step
+  // for anything the eye is tracking, and a marker that drifts further from its
+  // object every second the phone stops sending (which the receiver is built to
+  // survive). Converting that sample once into RA/Dec pins it to the rotating
+  // celestial sphere instead, so drawSelectionOverlay() can re-derive its az/alt
+  // every frame and the ring rides along with the star field.
+  //
+  // Same spherical triangle as raDecToAltAz, solved for Dec and the hour angle:
+  //   sin(Dec)         = sin(alt)·sin(lat) + cos(alt)·cos(lat)·cos(az)
+  //   cos(HA)·cos(Dec) = sin(alt)·cos(lat) − cos(alt)·cos(az)·sin(lat)
+  //   sin(HA)·cos(Dec) = −cos(alt)·sin(az)
+  // Both HA terms carry the same cos(Dec) factor, which cancels inside atan2 —
+  // no division by zero at the celestial poles.
+  //
+  // @param altDeg  APPARENT (refracted) altitude, i.e. what raDecToAltAz
+  //                returns and what the phone sends — it is un-refracted here
+  //                so the round trip lands back on the RA/Dec it came from.
+  // @returns { ra, dec } in degrees, equinox of date.
+  function altAzToRaDec(azDeg, altDeg, latDeg, lngDeg, date) {
+    const alt = rad(trueFromApparentDeg(altDeg));
+    const az  = rad(azDeg);
+    const lat = rad(latDeg);
+
+    const sinDec = Math.sin(alt) * Math.sin(lat) + Math.cos(alt) * Math.cos(lat) * Math.cos(az);
+    const decR = Math.asin(Math.max(-1, Math.min(1, sinDec)));
+
+    const haR = Math.atan2(
+      -Math.cos(alt) * Math.sin(az),
+      Math.sin(alt) * Math.cos(lat) - Math.cos(alt) * Math.cos(az) * Math.sin(lat),
+    );
+
+    const ra = ((lstDeg(date, lngDeg) - deg(haR)) % 360 + 360) % 360;
+    return { ra, dec: deg(decR) };
   }
 
   // ─── Alt / Az → 3-D unit vector ───────────────────────────────────────────
@@ -341,9 +399,10 @@ const Astro = (() => {
   // raDecToXYZInto() instead of recomputing any of it per star.
 
   return {
-    raDecToAltAz, altAzToXYZ, altAzToXY, skyContext, raDecToXYZInto,
+    raDecToAltAz, altAzToRaDec, altAzToXYZ, altAzToXY, skyContext, raDecToXYZInto,
     precessionAngles, julianDay, lstDeg, rad, deg,
-    refractionDeg, apparentFromTrueDeg, topocentricAltDeg,
+    refractionDeg, apparentFromTrueDeg, refractionFromApparentDeg,
+    trueFromApparentDeg, topocentricAltDeg,
   };
 
 })();

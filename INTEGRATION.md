@@ -200,6 +200,22 @@ All messages use namespace `urn:x-cast:com.skymap.receiver`. SETUP, LAYERS and S
 persist to `localStorage` (or echo it back) so a Chromecast reboot resumes the last
 setup on its own, without the phone reconnecting — see `receiver.js` `loadSetup()`.
 
+**`utcMillis` — present on every phone → receiver message.** The phone stamps it in
+`ProjectorSetupManager.sendJson()` from the app's `TimeSource` (so time-travelling the
+phone takes the projector with it), and the receiver takes its clock from it — see
+`syncClock()` in `receiver.js`. Every position the receiver draws is a function of
+sidereal time, so a second of clock error rotates its whole sky by 15", a minute by
+0.25°; that reads as the SELECT ring sitting off the object it marks, worst near the
+edges of the frame where the calibration homography packs the most pixels into a degree.
+A Cast device's own clock is NTP-synced at boot, i.e. least trustworthy exactly when the
+receiver starts drawing from its persisted setup.
+
+It costs no extra traffic (SELECT alone repeats once a second while anything is
+selected) and the receiver carries the last value forward on `performance.now()`, so it
+keeps correct time indefinitely after the phone disconnects and is immune to a later NTP
+jump on the TV. The offset is deliberately not persisted: absent a phone, the receiver
+falls back to the device clock. A sender that omits the field is ignored, not trusted.
+
 ### QUAD_CORNERS (live, throttled to ~20/sec)
 ```json
 {
